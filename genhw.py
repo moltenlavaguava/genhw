@@ -12,7 +12,6 @@ import json
 import urllib.request
 import urllib.error
 
-# test
 # Loaded after the dependency check so the script can repair a missing
 # nbformat installation instead of crashing immediately on startup.
 nbf = None
@@ -35,7 +34,8 @@ REPO_URL = "https://github.com/moltenlavaguava/genhw"
 REPO_API_COMMITS = "https://api.github.com/repos/moltenlavaguava/genhw/commits/main"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "genhw_config.json")
+LEGACY_CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 
 DEFAULT_CONFIG = {
     "first_name": "First",
@@ -51,7 +51,15 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    """Load configuration from config.json, prompting setup if missing."""
+    """Load configuration from genhw_config.json, prompting setup if missing."""
+    # Seamless migration from old config.json if present
+    if not os.path.exists(CONFIG_FILE) and os.path.exists(LEGACY_CONFIG_FILE):
+        try:
+            shutil.move(LEGACY_CONFIG_FILE, CONFIG_FILE)
+            print(f"[*] Migrated legacy config.json -> {CONFIG_FILE}")
+        except Exception:
+            pass
+
     if not os.path.exists(CONFIG_FILE):
         return prompt_initial_config()
 
@@ -60,18 +68,18 @@ def load_config():
             user_cfg = json.load(f)
             return {**DEFAULT_CONFIG, **user_cfg}
     except Exception as e:
-        print(f"[!] Warning: Could not read config.json ({e}). Using defaults.")
+        print(f"[!] Warning: Could not read {os.path.basename(CONFIG_FILE)} ({e}). Using defaults.")
         return DEFAULT_CONFIG.copy()
 
 
 def save_config(cfg):
-    """Save dictionary to config.json."""
+    """Save dictionary to genhw_config.json."""
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=4)
         print(f"[*] Configuration saved to {CONFIG_FILE}")
     except Exception as e:
-        print(f"[!] Error saving config.json: {e}")
+        print(f"[!] Error saving {os.path.basename(CONFIG_FILE)}: {e}")
 
 
 def prompt_initial_config():
@@ -146,7 +154,11 @@ def _is_git_repository():
 
 
 def check_for_updates(verbose=False):
-    """Check for updates against GitHub and prompt to update."""
+    """
+    Check for updates against GitHub and prompt to update.
+    Returns: (is_updated: bool, status: str)
+      status values: 'updated', 'cancelled', 'up_to_date', 'error'
+    """
     if _is_git_repository():
         return _check_git_updates(verbose=verbose)
     else:
@@ -164,7 +176,7 @@ def _check_git_updates(verbose=False):
             capture_output=True, text=True, timeout=4, env=env, check=False
         )
         if local_head_res.returncode != 0:
-            return False
+            return False, "error"
         local_sha = local_head_res.stdout.strip()
 
         if verbose:
@@ -193,12 +205,10 @@ def _check_git_updates(verbose=False):
         if not remote_sha:
             if verbose:
                 print("[!] Could not connect to remote repository.")
-            return False
+            return False, "error"
 
         if local_sha == remote_sha:
-            if verbose:
-                print("[*] Local repository is already up to date with GitHub.")
-            return False
+            return False, "up_to_date"
 
         print("\n" + "=" * 60)
         print(f" [!] An update is available on GitHub ({REPO_URL})!")
@@ -213,18 +223,23 @@ def _check_git_updates(verbose=False):
             )
             if pull_res.returncode == 0:
                 print("[SUCCESS] Repository updated successfully!")
-                return True
+                return True, "updated"
             else:
                 print(f"[!] Git pull failed: {pull_res.stderr.strip()}")
                 print("    You may have local uncommitted changes.\n")
+                return False, "error"
+        else:
+            print("[*] Update cancelled.")
+            return False, "cancelled"
 
     except subprocess.TimeoutExpired:
         if verbose:
             print("[!] Git network operation timed out.")
+        return False, "error"
     except Exception as e:
         if verbose:
             print(f"[!] Git update error: {e}")
-    return False
+        return False, "error"
 
 
 def _check_standalone_updates(verbose=False):
@@ -250,7 +265,7 @@ def _check_standalone_updates(verbose=False):
         if not remote_sha:
             if verbose:
                 print("[!] Could not retrieve commit data from GitHub.")
-            return False
+            return False, "error"
 
         sha_file = os.path.join(SCRIPT_DIR, ".version")
         local_sha = ""
@@ -292,11 +307,14 @@ def _check_standalone_updates(verbose=False):
 
                 with open(os.path.abspath(__file__), "w", encoding="utf-8") as f:
                     f.write(new_code)
-                with open(sha_file, "w", encoding="utf-8") as f:
+                with open(sha_file, "w") as f:
                     f.write(remote_sha)
 
                 print("[SUCCESS] genhw.py updated successfully!")
-                return True
+                return True, "updated"
+            else:
+                print("[*] Update cancelled.")
+                return False, "cancelled"
         else:
             if not local_sha:
                 try:
@@ -304,12 +322,12 @@ def _check_standalone_updates(verbose=False):
                         f.write(remote_sha)
                 except Exception:
                     pass
-            if verbose:
-                print(f"[*] genhw.py is already up to date with GitHub (commit {remote_sha[:7]}).")
+            return False, "up_to_date"
+
     except Exception as e:
         if verbose:
             print(f"[!] Standalone update check error: {e}")
-    return False
+        return False, "error"
 
 
 # Python packages used by this script and by the starter notebook it creates.
@@ -510,12 +528,14 @@ def ensure_dependencies(require_pdf=False):
         if not _command_works("xelatex"):
             missing_system.append("xelatex")
 
+    # Auto-install Python packages via uv (or pip) without friction
     if missing_python:
         if not _install_python_dependencies(missing_python):
             print("[!] One or more Python dependencies could not be installed.")
             return False
         importlib.invalidate_caches()
 
+    # Heavy system tools (Pandoc / LaTeX) require system-level privileges; prompt first
     if missing_system:
         print("\n[!] Missing system tools for PDF export: " + ", ".join(missing_system))
         if not _ask_yes_no("Would you like to install/repair them now?", default=True):
@@ -1246,20 +1266,21 @@ def main():
 
     args = parser.parse_args()
 
-    # Load configuration from config.json
+    # Load configuration from genhw_config.json
     cfg = load_config()
     reload_globals_from_config(cfg)
 
     # Explicit update command
     if args.command == 'update':
-        updated = check_for_updates(verbose=True)
-        if not updated:
+        updated, status = check_for_updates(verbose=True)
+        if status == "up_to_date":
             print("[*] genhw is already up to date.")
         return
 
     # Automatic update check (with instant command resume)
     if cfg.get("check_updates", True) and not args.skip_update and args.command != 'config':
-        if check_for_updates(verbose=False):
+        updated, status = check_for_updates(verbose=False)
+        if updated:
             clean_args = [arg for arg in sys.argv[1:] if arg != "--skip-update"] + ["--skip-update"]
             print("[*] Resuming command with updated version...\n")
             try:
