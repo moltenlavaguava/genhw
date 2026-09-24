@@ -1,2 +1,5 @@
 !.gitignore
 !.genhw.py
+config.json
+.version
+__tmp_*
