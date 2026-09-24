@@ -12,7 +12,6 @@ import json
 import urllib.request
 import urllib.error
 
-# test
 # Loaded after the dependency check so the script can repair a missing
 # nbformat installation instead of crashing immediately on startup.
 nbf = None
@@ -33,7 +32,6 @@ nbf = None
 
 REPO_URL = "https://github.com/moltenlavaguava/genhw"
 REPO_API_COMMITS = "https://api.github.com/repos/moltenlavaguava/genhw/commits/main"
-RAW_SCRIPT_URL = "https://raw.githubusercontent.com/moltenlavaguava/genhw/main/genhw.py"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
@@ -128,7 +126,7 @@ def reload_globals_from_config(cfg):
 
 
 # ==============================================================================
-# AUTO-UPDATE & SEAMLESS RE-EXECUTION
+# REAL-TIME STANDALONE & GIT AUTO-UPDATE SYSTEM
 # ==============================================================================
 
 def _is_git_repository():
@@ -155,131 +153,161 @@ def check_for_updates(verbose=False):
 
 
 def _check_git_updates(verbose=False):
-    """Check and pull updates using Git inside a cloned repository."""
+    """Check and pull updates using real-time Git ls-remote comparison."""
     try:
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+
+        local_head_res = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=4, env=env, check=False
+        )
+        if local_head_res.returncode != 0:
+            return False
+        local_sha = local_head_res.stdout.strip()
+
         if verbose:
-            print(f"[*] Checking git updates from {REPO_URL}...")
+            print(f"[*] Querying live repository {REPO_URL}...")
 
-        # 1. Identify active remote
-        remotes_res = subprocess.run(
-            ["git", "-C", SCRIPT_DIR, "remote"],
-            capture_output=True, text=True, timeout=3, check=False
+        ls_res = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "ls-remote", "origin", "HEAD"],
+            capture_output=True, text=True, timeout=6, env=env, check=False
         )
-        available_remotes = remotes_res.stdout.split()
-        if not available_remotes:
-            if verbose:
-                print("[!] No git remotes found in this repository.")
-            return False
+        remote_sha = ""
+        if ls_res.returncode == 0 and ls_res.stdout.strip():
+            remote_sha = ls_res.stdout.split()[0].strip()
 
-        remote = "origin" if "origin" in available_remotes else available_remotes[0]
+        if not remote_sha:
+            ls_res2 = subprocess.run(
+                ["git", "-C", SCRIPT_DIR, "ls-remote", REPO_URL, "HEAD"],
+                capture_output=True, text=True, timeout=6, env=env, check=False
+            )
+            if ls_res2.returncode == 0 and ls_res2.stdout.strip():
+                remote_sha = ls_res2.stdout.split()[0].strip()
 
-        # 2. Fetch updates with a generous 8-second timeout
         if verbose:
-            print(f"    Fetching remote '{remote}'...")
-        fetch_res = subprocess.run(
-            ["git", "-C", SCRIPT_DIR, "fetch", remote],
-            capture_output=True, text=True, timeout=8, check=False
-        )
-        if fetch_res.returncode != 0:
+            print(f"    Local commit:  {local_sha[:7]}")
+            print(f"    Remote commit: {remote_sha[:7] if remote_sha else 'Unknown'}")
+
+        if not remote_sha:
             if verbose:
-                print(f"[!] Git fetch failed: {fetch_res.stderr.strip()}")
+                print("[!] Could not connect to remote repository.")
             return False
 
-        # 3. Determine upstream tracking branch
-        upstream_res = subprocess.run(
-            ["git", "-C", SCRIPT_DIR, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-            capture_output=True, text=True, timeout=3, check=False
-        )
-        upstream = upstream_res.stdout.strip() if upstream_res.returncode == 0 else ""
-
-        # Fallback to remote/main or remote/master if not tracking
-        if not upstream:
-            for branch_candidate in [f"{remote}/main", f"{remote}/master"]:
-                b_check = subprocess.run(
-                    ["git", "-C", SCRIPT_DIR, "rev-parse", "--verify", branch_candidate],
-                    capture_output=True, text=True, timeout=3, check=False
-                )
-                if b_check.returncode == 0:
-                    upstream = branch_candidate
-                    break
-
-        if not upstream:
+        if local_sha == remote_sha:
             if verbose:
-                print("[!] Could not determine upstream tracking branch.")
+                print("[*] Local repository is already up to date with GitHub.")
             return False
 
-        # 4. Count commits behind upstream
-        count_res = subprocess.run(
-            ["git", "-C", SCRIPT_DIR, "rev-list", "--count", f"HEAD..{upstream}"],
-            capture_output=True, text=True, timeout=3, check=False
-        )
-        if count_res.returncode != 0:
-            if verbose:
-                print(f"[!] Error comparing branches: {count_res.stderr.strip()}")
-            return False
-
-        behind_count = int(count_res.stdout.strip() or 0)
-        if behind_count > 0:
-            print("\n" + "=" * 60)
-            print(f" [!] An update is available! You are {behind_count} commit(s) behind {upstream}.")
-            print("=" * 60)
-            if _ask_yes_no("[?] Would you like to pull the latest updates now?", default=True):
-                print("[*] Pulling latest updates...")
-                pull_res = subprocess.run(
-                    ["git", "-C", SCRIPT_DIR, "pull", "--ff-only"],
-                    capture_output=True, text=True, check=False
-                )
-                if pull_res.returncode == 0:
-                    print("[SUCCESS] Repository updated successfully!")
-                    return True
-                else:
-                    print(f"[!] Git pull failed: {pull_res.stderr.strip()}")
-                    print("    You may have local uncommitted changes.\n")
-        else:
-            if verbose:
-                print(f"[*] Repository is up to date with {upstream}.")
+        print("\n" + "=" * 60)
+        print(f" [!] An update is available on GitHub ({REPO_URL})!")
+        print(f"     Local:  {local_sha[:7]}")
+        print(f"     Remote: {remote_sha[:7]}")
+        print("=" * 60)
+        if _ask_yes_no("[?] Would you like to pull the latest updates now?", default=True):
+            print("[*] Pulling latest updates...")
+            pull_res = subprocess.run(
+                ["git", "-C", SCRIPT_DIR, "pull"],
+                capture_output=True, text=True, timeout=15, env=env, check=False
+            )
+            if pull_res.returncode == 0:
+                print("[SUCCESS] Repository updated successfully!")
+                return True
+            else:
+                print(f"[!] Git pull failed: {pull_res.stderr.strip()}")
+                print("    You may have local uncommitted changes.\n")
 
     except subprocess.TimeoutExpired:
         if verbose:
-            print("[!] Git check timed out. Network connection may be slow or offline.")
+            print("[!] Git network operation timed out.")
     except Exception as e:
         if verbose:
-            print(f"[!] Update check error: {e}")
+            print(f"[!] Git update error: {e}")
     return False
 
 
 def _check_standalone_updates(verbose=False):
-    """Fallback update check for standalone genhw.py comparing script contents with GitHub."""
+    """
+    Standalone updater: queries GitHub API for latest commit and updates genhw.py directly.
+    Bypasses GitHub Fastly 5-minute CDN cache by querying the commit SHA directly.
+    """
     try:
         if verbose:
-            print(f"[*] Checking GitHub for standalone updates from {RAW_SCRIPT_URL}...")
+            print(f"[*] Checking GitHub API for latest commit ({REPO_API_COMMITS})...")
 
         req = urllib.request.Request(
-            RAW_SCRIPT_URL,
-            headers={"User-Agent": "genhw-updater"}
+            REPO_API_COMMITS,
+            headers={
+                "User-Agent": "genhw-updater",
+                "Accept": "application/vnd.github.v3+json",
+            }
         )
-        with urllib.request.urlopen(req, timeout=8) as dl:
-            remote_code = dl.read().decode("utf-8")
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode())
+            remote_sha = data.get("sha", "")
+
+        if not remote_sha:
+            if verbose:
+                print("[!] Could not retrieve commit data from GitHub.")
+            return False
+
+        sha_file = os.path.join(SCRIPT_DIR, ".version")
+        local_sha = ""
+        if os.path.exists(sha_file):
+            try:
+                with open(sha_file, "r") as f:
+                    local_sha = f.read().strip()
+            except Exception:
+                pass
+
+        # Use the specific commit SHA URL to bypass GitHub's 5-minute CDN cache completely
+        raw_url = f"https://raw.githubusercontent.com/moltenlavaguava/genhw/{remote_sha}/genhw.py"
 
         with open(os.path.abspath(__file__), "r", encoding="utf-8") as f:
             local_code = f.read()
 
-        # Compare normalized file contents
-        if remote_code.replace("\r\n", "\n").strip() != local_code.replace("\r\n", "\n").strip():
+        needs_update = False
+        if local_sha:
+            needs_update = (local_sha != remote_sha)
+        else:
+            dl_req = urllib.request.Request(raw_url, headers={"User-Agent": "genhw-updater"})
+            with urllib.request.urlopen(dl_req, timeout=8) as dl:
+                remote_code = dl.read().decode("utf-8")
+            needs_update = (remote_code.replace("\r\n", "\n").strip() != local_code.replace("\r\n", "\n").strip())
+
+        if verbose:
+            print(f"    Local version:  {local_sha[:7] if local_sha else 'standalone'}")
+            print(f"    Remote version: {remote_sha[:7]}")
+
+        if needs_update:
             print("\n" + "=" * 60)
-            print(" [!] A newer version of genhw.py is available on GitHub!")
+            print(f" [!] An update is available on GitHub (commit {remote_sha[:7]})!")
             print("=" * 60)
             if _ask_yes_no("[?] Update genhw.py directly from GitHub?", default=True):
+                print("[*] Downloading latest genhw.py...")
+                dl_req = urllib.request.Request(raw_url, headers={"User-Agent": "genhw-updater"})
+                with urllib.request.urlopen(dl_req, timeout=10) as dl:
+                    new_code = dl.read().decode("utf-8")
+
                 with open(os.path.abspath(__file__), "w", encoding="utf-8") as f:
-                    f.write(remote_code)
+                    f.write(new_code)
+                with open(sha_file, "w", encoding="utf-8") as f:
+                    f.write(remote_sha)
+
                 print("[SUCCESS] genhw.py updated successfully!")
                 return True
         else:
+            if not local_sha:
+                try:
+                    with open(sha_file, "w", encoding="utf-8") as f:
+                        f.write(remote_sha)
+                except Exception:
+                    pass
             if verbose:
-                print("[*] genhw.py is already up to date with GitHub.")
+                print(f"[*] genhw.py is already up to date with GitHub (commit {remote_sha[:7]}).")
     except Exception as e:
         if verbose:
-            print(f"[!] Standalone check error: {e}")
+            print(f"[!] Standalone update check error: {e}")
     return False
 
 
@@ -341,7 +369,7 @@ def _ask_yes_no(prompt, default=True):
 
 
 def _get_uv_command():
-    """Return command prefix to run 'uv pip install' targeting the active Python, if uv is available."""
+    """Return command prefix to run 'uv pip install' targeting active Python if available."""
     if _command_works("uv"):
         return ["uv", "pip", "install", "--python", sys.executable]
     if _python_module_works("uv"):
@@ -354,7 +382,6 @@ def _install_python_dependencies(packages):
     if not packages:
         return True
 
-    # 1. Try uv first for speed
     uv_cmd = _get_uv_command()
     if uv_cmd:
         print(f"\n[*] Auto-installing Python dependencies using uv: {', '.join(packages)}")
@@ -366,7 +393,6 @@ def _install_python_dependencies(packages):
         except Exception as e:
             print(f"[!] Could not run uv ({e}); falling back to standard pip...")
 
-    # 2. Fallback to pip
     print(f"\n[*] Installing Python dependencies using pip: {', '.join(packages)}")
     cmd = [sys.executable, "-m", "pip", "install", *packages]
     try:
@@ -483,14 +509,12 @@ def ensure_dependencies(require_pdf=False):
         if not _command_works("xelatex"):
             missing_system.append("xelatex")
 
-    # Auto-install Python packages via uv (or pip) without friction
     if missing_python:
         if not _install_python_dependencies(missing_python):
             print("[!] One or more Python dependencies could not be installed.")
             return False
         importlib.invalidate_caches()
 
-    # Heavy system tools (Pandoc / LaTeX) require system-level privileges; prompt first
     if missing_system:
         print("\n[!] Missing system tools for PDF export: " + ", ".join(missing_system))
         if not _ask_yes_no("Would you like to install/repair them now?", default=True):
@@ -630,12 +654,7 @@ def _markdown_fragment_to_latex(text):
 
 
 def preserve_markdown_html_formatting(text):
-    """Preserve common HTML presentation tags when exporting Markdown to PDF.
-
-    nbconvert/Pandoc normally discards HTML-only alignment such as <center>
-    and CSS text-align. Only cells that actually contain these HTML tags are
-    touched; ordinary notebook Markdown is left byte-for-byte unchanged.
-    """
+    """Preserve common HTML presentation tags when exporting Markdown to PDF."""
     if not text or '<' not in text:
         return text
 
