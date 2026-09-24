@@ -12,6 +12,7 @@ import json
 import urllib.request
 import urllib.error
 
+# test
 # Loaded after the dependency check so the script can repair a missing
 # nbformat installation instead of crashing immediately on startup.
 nbf = None
