@@ -1,6 +1,6 @@
 # yoooo why u here lol?
 
-this project is entirely vibe coded :PPPPPPPP
+this project is entirely vibe coded :PPPPPPP
 
 anyway, have the first picture of "cat" on google:
 
