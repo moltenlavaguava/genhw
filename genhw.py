@@ -12,8 +12,7 @@ import json
 import urllib.request
 import urllib.error
 
-# test
-# Loaded after the dependency check so the script can repair a missing 
+# Loaded after the dependency check so the script can repair a missing
 # nbformat installation instead of crashing immediately on startup.
 nbf = None
 
@@ -131,91 +130,155 @@ def reload_globals_from_config(cfg):
 # AUTO-UPDATE & SEAMLESS RE-EXECUTION
 # ==============================================================================
 
-def check_for_updates():
-    """Check for updates against GitHub and prompt to update."""
-    is_git_repo = os.path.exists(os.path.join(SCRIPT_DIR, ".git"))
-    if is_git_repo:
-        return _check_git_updates()
-    else:
-        return _check_standalone_updates()
-
-
-def _check_git_updates():
-    """Check and pull updates using Git inside a cloned repository."""
+def _is_git_repository():
+    """Check if the script directory is inside a functioning git repository."""
     try:
-        subprocess.run(
-            ["git", "-C", SCRIPT_DIR, "fetch", "origin", "main"],
-            capture_output=True,
-            timeout=3,
-            check=False,
-        )
-
         res = subprocess.run(
-            ["git", "-C", SCRIPT_DIR, "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "-C", SCRIPT_DIR, "rev-parse", "--is-inside-work-tree"],
             capture_output=True,
             text=True,
-            check=False,
+            timeout=3,
+            check=False
         )
-
-        if res.returncode == 0:
-            behind_count = int(res.stdout.strip() or 0)
-            if behind_count > 0:
-                print("\n" + "=" * 60)
-                print(f" [!] An update is available! You are {behind_count} commit(s) behind {REPO_URL}.")
-                print("=" * 60)
-                if _ask_yes_no("[?] Would you like to pull the latest updates now?", default=True):
-                    print("[*] Pulling latest updates...")
-                    pull_res = subprocess.run(
-                        ["git", "-C", SCRIPT_DIR, "pull", "--ff-only"],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                    if pull_res.returncode == 0:
-                        print("[SUCCESS] Repository updated successfully!")
-                        return True
-                    else:
-                        print(f"[!] Git pull failed: {pull_res.stderr.strip()}")
-                        print("    You may have local uncommitted changes.\n")
-    except subprocess.TimeoutExpired:
-        pass
+        return res.returncode == 0 and res.stdout.strip() == "true"
     except Exception:
-        pass
+        return False
+
+
+def check_for_updates(verbose=False):
+    """Check for updates against GitHub and prompt to update."""
+    if _is_git_repository():
+        return _check_git_updates(verbose=verbose)
+    else:
+        return _check_standalone_updates(verbose=verbose)
+
+
+def _check_git_updates(verbose=False):
+    """Check and pull updates using Git inside a cloned repository."""
+    try:
+        if verbose:
+            print(f"[*] Checking git updates from {REPO_URL}...")
+
+        # 1. Identify active remote
+        remotes_res = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "remote"],
+            capture_output=True, text=True, timeout=3, check=False
+        )
+        available_remotes = remotes_res.stdout.split()
+        if not available_remotes:
+            if verbose:
+                print("[!] No git remotes found in this repository.")
+            return False
+
+        remote = "origin" if "origin" in available_remotes else available_remotes[0]
+
+        # 2. Fetch updates with a generous 8-second timeout
+        if verbose:
+            print(f"    Fetching remote '{remote}'...")
+        fetch_res = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "fetch", remote],
+            capture_output=True, text=True, timeout=8, check=False
+        )
+        if fetch_res.returncode != 0:
+            if verbose:
+                print(f"[!] Git fetch failed: {fetch_res.stderr.strip()}")
+            return False
+
+        # 3. Determine upstream tracking branch
+        upstream_res = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            capture_output=True, text=True, timeout=3, check=False
+        )
+        upstream = upstream_res.stdout.strip() if upstream_res.returncode == 0 else ""
+
+        # Fallback to remote/main or remote/master if not tracking
+        if not upstream:
+            for branch_candidate in [f"{remote}/main", f"{remote}/master"]:
+                b_check = subprocess.run(
+                    ["git", "-C", SCRIPT_DIR, "rev-parse", "--verify", branch_candidate],
+                    capture_output=True, text=True, timeout=3, check=False
+                )
+                if b_check.returncode == 0:
+                    upstream = branch_candidate
+                    break
+
+        if not upstream:
+            if verbose:
+                print("[!] Could not determine upstream tracking branch.")
+            return False
+
+        # 4. Count commits behind upstream
+        count_res = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "rev-list", "--count", f"HEAD..{upstream}"],
+            capture_output=True, text=True, timeout=3, check=False
+        )
+        if count_res.returncode != 0:
+            if verbose:
+                print(f"[!] Error comparing branches: {count_res.stderr.strip()}")
+            return False
+
+        behind_count = int(count_res.stdout.strip() or 0)
+        if behind_count > 0:
+            print("\n" + "=" * 60)
+            print(f" [!] An update is available! You are {behind_count} commit(s) behind {upstream}.")
+            print("=" * 60)
+            if _ask_yes_no("[?] Would you like to pull the latest updates now?", default=True):
+                print("[*] Pulling latest updates...")
+                pull_res = subprocess.run(
+                    ["git", "-C", SCRIPT_DIR, "pull", "--ff-only"],
+                    capture_output=True, text=True, check=False
+                )
+                if pull_res.returncode == 0:
+                    print("[SUCCESS] Repository updated successfully!")
+                    return True
+                else:
+                    print(f"[!] Git pull failed: {pull_res.stderr.strip()}")
+                    print("    You may have local uncommitted changes.\n")
+        else:
+            if verbose:
+                print(f"[*] Repository is up to date with {upstream}.")
+
+    except subprocess.TimeoutExpired:
+        if verbose:
+            print("[!] Git check timed out. Network connection may be slow or offline.")
+    except Exception as e:
+        if verbose:
+            print(f"[!] Update check error: {e}")
     return False
 
 
-def _check_standalone_updates():
-    """Fallback update check for standalone genhw.py without a .git folder."""
+def _check_standalone_updates(verbose=False):
+    """Fallback update check for standalone genhw.py comparing script contents with GitHub."""
     try:
+        if verbose:
+            print(f"[*] Checking GitHub for standalone updates from {RAW_SCRIPT_URL}...")
+
         req = urllib.request.Request(
-            REPO_API_COMMITS,
+            RAW_SCRIPT_URL,
             headers={"User-Agent": "genhw-updater"}
         )
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read().decode())
-            remote_sha = data.get("sha", "")[:7]
+        with urllib.request.urlopen(req, timeout=8) as dl:
+            remote_code = dl.read().decode("utf-8")
 
-        sha_file = os.path.join(SCRIPT_DIR, ".version")
-        local_sha = ""
-        if os.path.exists(sha_file):
-            with open(sha_file, "r") as f:
-                local_sha = f.read().strip()
+        with open(os.path.abspath(__file__), "r", encoding="utf-8") as f:
+            local_code = f.read()
 
-        if remote_sha and local_sha and remote_sha != local_sha:
+        # Compare normalized file contents
+        if remote_code.replace("\r\n", "\n").strip() != local_code.replace("\r\n", "\n").strip():
             print("\n" + "=" * 60)
-            print(f" [!] A new release of genhw is available on GitHub (commit {remote_sha})!")
+            print(" [!] A newer version of genhw.py is available on GitHub!")
             print("=" * 60)
             if _ask_yes_no("[?] Update genhw.py directly from GitHub?", default=True):
-                with urllib.request.urlopen(RAW_SCRIPT_URL, timeout=5) as dl:
-                    new_code = dl.read().decode("utf-8")
-                with open(__file__, "w", encoding="utf-8") as f:
-                    f.write(new_code)
-                with open(sha_file, "w") as f:
-                    f.write(remote_sha)
+                with open(os.path.abspath(__file__), "w", encoding="utf-8") as f:
+                    f.write(remote_code)
                 print("[SUCCESS] genhw.py updated successfully!")
                 return True
-    except Exception:
-        pass
+        else:
+            if verbose:
+                print("[*] genhw.py is already up to date with GitHub.")
+    except Exception as e:
+        if verbose:
+            print(f"[!] Standalone check error: {e}")
     return False
 
 
@@ -566,7 +629,12 @@ def _markdown_fragment_to_latex(text):
 
 
 def preserve_markdown_html_formatting(text):
-    """Preserve common HTML presentation tags when exporting Markdown to PDF."""
+    """Preserve common HTML presentation tags when exporting Markdown to PDF.
+
+    nbconvert/Pandoc normally discards HTML-only alignment such as <center>
+    and CSS text-align. Only cells that actually contain these HTML tags are
+    touched; ordinary notebook Markdown is left byte-for-byte unchanged.
+    """
     if not text or '<' not in text:
         return text
 
@@ -1163,14 +1231,14 @@ def main():
 
     # Explicit update command
     if args.command == 'update':
-        updated = check_for_updates()
+        updated = check_for_updates(verbose=True)
         if not updated:
             print("[*] genhw is already up to date.")
         return
 
     # Automatic update check (with instant command resume)
     if cfg.get("check_updates", True) and not args.skip_update and args.command != 'config':
-        if check_for_updates():
+        if check_for_updates(verbose=False):
             clean_args = [arg for arg in sys.argv[1:] if arg != "--skip-update"] + ["--skip-update"]
             print("[*] Resuming command with updated version...\n")
             try:
