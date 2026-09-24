@@ -24,9 +24,9 @@ nbf = None
 
 
 # --- CONFIGURATION DEFAULTS ---
-FIRST_NAME = "Sean"
-LAST_NAME = "Merrill"
-SUBFOLDER = "Homework Problems"
+FIRST_NAME = "Input"
+LAST_NAME = "Input"
+SUBFOLDER = "Input"
 PDF_MARGIN = "0.5in"
 REMOVE_NOTEBOOK_TITLE_CELL = True
 REMOVE_EXECUTION_PROMPTS = True
