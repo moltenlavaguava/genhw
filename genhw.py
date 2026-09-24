@@ -276,7 +276,6 @@ def _check_standalone_updates(verbose=False):
             except Exception:
                 pass
 
-        # Use the specific commit SHA URL to bypass GitHub's 5-minute CDN cache completely
         raw_url = f"https://raw.githubusercontent.com/moltenlavaguava/genhw/{remote_sha}/genhw.py"
 
         with open(os.path.abspath(__file__), "r", encoding="utf-8") as f:
@@ -401,6 +400,7 @@ def _install_python_dependencies(packages):
     if not packages:
         return True
 
+    # 1. Try uv first for speed
     uv_cmd = _get_uv_command()
     if uv_cmd:
         print(f"\n[*] Auto-installing Python dependencies using uv: {', '.join(packages)}")
@@ -412,6 +412,7 @@ def _install_python_dependencies(packages):
         except Exception as e:
             print(f"[!] Could not run uv ({e}); falling back to standard pip...")
 
+    # 2. Fallback to pip
     print(f"\n[*] Installing Python dependencies using pip: {', '.join(packages)}")
     cmd = [sys.executable, "-m", "pip", "install", *packages]
     try:
@@ -1239,17 +1240,23 @@ def positive_int(value):
 # ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Homework and Exam Notebook/PDF Tool")
-    parser.add_argument("--skip-update", action="store_true", help="Skip checking for updates")
+    # Base parser shared with all commands so --skip-update is accepted anywhere
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument("--skip-update", action="store_true", help="Skip checking for updates")
+
+    parser = argparse.ArgumentParser(
+        description="Homework and Exam Notebook/PDF Tool",
+        parents=[base_parser]
+    )
     subparsers = parser.add_subparsers(dest="command")
 
-    gen = subparsers.add_parser('gen', help="Create problem notebook templates")
+    gen = subparsers.add_parser('gen', parents=[base_parser], help="Create problem notebook templates")
     gen_target = gen.add_mutually_exclusive_group(required=True)
     gen_target.add_argument('-hw', '--hw_num', type=positive_int, help='Homework number')
     gen_target.add_argument('-exam', '--exam', '--exam_num', dest='exam_num', type=positive_int, help='Exam number')
     gen.add_argument('-n', '--num', type=positive_int, required=True, help='Number of problem notebooks to create')
 
-    pdf = subparsers.add_parser('pdf', help="Export notebooks to PDF")
+    pdf = subparsers.add_parser('pdf', parents=[base_parser], help="Export notebooks to PDF")
     pdf_target = pdf.add_mutually_exclusive_group(required=True)
     pdf_target.add_argument('-hw', '--hw_num', type=positive_int, help='Export a homework folder')
     pdf_target.add_argument('-exam', '--exam', '--exam_num', dest='exam_num', type=positive_int, help='Export an exam folder')
@@ -1258,11 +1265,11 @@ def main():
     pdf.add_argument('-d', '--debug', action='store_true', help='Preserve intermediate LaTeX files')
 
     # Command: config
-    cfg_cmd = subparsers.add_parser('config', help="View or modify user configuration")
+    cfg_cmd = subparsers.add_parser('config', parents=[base_parser], help="View or modify user configuration")
     cfg_cmd.add_argument('--set', nargs='+', help="Set config values (e.g. --set first_name=Alice subfolder='Homework')")
 
     # Command: update
-    subparsers.add_parser('update', help="Force check and pull updates from GitHub")
+    subparsers.add_parser('update', parents=[base_parser], help="Force check and pull updates from GitHub")
 
     args = parser.parse_args()
 
@@ -1281,7 +1288,8 @@ def main():
     if cfg.get("check_updates", True) and not args.skip_update and args.command != 'config':
         updated, status = check_for_updates(verbose=False)
         if updated:
-            clean_args = [arg for arg in sys.argv[1:] if arg != "--skip-update"] + ["--skip-update"]
+            # Place --skip-update right after the script name before subcommands
+            clean_args = ["--skip-update"] + [arg for arg in sys.argv[1:] if arg != "--skip-update"]
             print("[*] Resuming command with updated version...\n")
             try:
                 res = subprocess.run([sys.executable, os.path.abspath(__file__), *clean_args])
