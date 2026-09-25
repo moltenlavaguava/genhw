@@ -48,7 +48,7 @@ DEFAULT_CONFIG = {
     "remove_notebook_title_cell": True,
     "remove_execution_prompts": True,
     "unnumber_markdown_headings": True,
-    "check_updates": False,
+    "check_updates": True,
 }
 
 
@@ -732,7 +732,7 @@ def preserve_markdown_html_formatting(text):
 # Regions that must never be modified: fenced code, inline code, display math.
 _PROTECTED_MD = re.compile(r'(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`|\$\$[\s\S]*?\$\$)')
 _INLINE_MATH = re.compile(r'(?<![\\$])\$(?!\$)([^$\n]+?)(?<!\\)\$(?!\$)')
-_MATHY = re.compile(r'[\\^_{}=]')
+_MATHY = re.compile(r'[\\^_{}=+\-*/<>]')
 
 
 def normalize_inline_math_spacing(text):
