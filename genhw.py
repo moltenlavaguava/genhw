@@ -1,3 +1,5 @@
+### Imports
+
 import os
 import argparse
 import subprocess
@@ -8,30 +10,325 @@ import glob
 import importlib
 import importlib.util
 import platform
+import json
+import urllib.request
+import urllib.error
 
 # Loaded after the dependency check so the script can repair a missing
 # nbformat installation instead of crashing immediately on startup.
 nbf = None
 
-#Command to make a new homework with the first number 
-#being the homework number and second number being number of problems.
-
+# Command to make a new homework with the first number 
+# being the homework number and second number being number of problems.
 
 # Command to Generate the files         python genhw.py gen -hw 1 -n 2
 
 # Command to Generate the pdfs          python genhw.py pdf -hw 2
+# Command to Generate exam files        python genhw.py gen -exam 1 -n 2
+# Command to Generate exam PDFs         python genhw.py pdf -exam 1
 
 
+# ==============================================================================
+# CONFIGURATION & REPOSITORY DEFAULTS
+# ==============================================================================
 
-# --- CONFIGURATION DEFAULTS ---
-FIRST_NAME = "Input"
-LAST_NAME = "Input"
-SUBFOLDER = "Input"
-PDF_MARGIN = "0.5in"
-REMOVE_NOTEBOOK_TITLE_CELL = True
-REMOVE_EXECUTION_PROMPTS = True
-UNNUMBER_MARKDOWN_HEADINGS = True
-# ------------------------------
+REPO_URL = "https://github.com/moltenlavaguava/genhw"
+REPO_API_COMMITS = "https://api.github.com/repos/moltenlavaguava/genhw/commits/main"
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "genhw_config.json")
+LEGACY_CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+
+DEFAULT_CONFIG = {
+    "first_name": "First",
+    "last_name": "Last",
+    "subfolder": "Homework Problems",
+    "exam_subfolder": "Exam Problems",
+    "pdf_margin": "0.5in",
+    "remove_notebook_title_cell": True,
+    "remove_execution_prompts": True,
+    "unnumber_markdown_headings": True,
+    "check_updates": False,
+}
+
+
+def load_config():
+    """Load configuration from genhw_config.json, prompting setup if missing."""
+    # Seamless migration from old config.json if present
+    if not os.path.exists(CONFIG_FILE) and os.path.exists(LEGACY_CONFIG_FILE):
+        try:
+            shutil.move(LEGACY_CONFIG_FILE, CONFIG_FILE)
+            print(f"[*] Migrated legacy config.json -> {CONFIG_FILE}")
+        except Exception:
+            pass
+
+    if not os.path.exists(CONFIG_FILE):
+        return prompt_initial_config()
+
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            user_cfg = json.load(f)
+            return {**DEFAULT_CONFIG, **user_cfg}
+    except Exception as e:
+        print(f"[!] Warning: Could not read {os.path.basename(CONFIG_FILE)} ({e}). Using defaults.")
+        return DEFAULT_CONFIG.copy()
+
+
+def save_config(cfg):
+    """Save dictionary to genhw_config.json."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        print(f"[*] Configuration saved to {CONFIG_FILE}")
+    except Exception as e:
+        print(f"[!] Error saving {os.path.basename(CONFIG_FILE)}: {e}")
+
+
+def prompt_initial_config():
+    """Interactive prompt on first run to configure user identity."""
+    print("\n" + "=" * 55)
+    print(" [*] First-Time Setup: Configure your genhw profile")
+    print("=" * 55)
+    try:
+        first = input("Enter your First Name [First]: ").strip() or "First"
+        last = input("Enter your Last Name [Last]: ").strip() or "Last"
+        subfolder = input("Homework subfolder [Homework Problems]: ").strip() or "Homework Problems"
+        exam_sub = input("Exam subfolder [Exam Problems]: ").strip() or "Exam Problems"
+    except (EOFError, KeyboardInterrupt):
+        print()
+        first, last, subfolder, exam_sub = "First", "Last", "Homework Problems", "Exam Problems"
+
+    cfg = {
+        **DEFAULT_CONFIG,
+        "first_name": first,
+        "last_name": last,
+        "subfolder": subfolder,
+        "exam_subfolder": exam_sub,
+    }
+    save_config(cfg)
+    print("=" * 55 + "\n")
+    return cfg
+
+
+# Initialize active configuration and variables
+CONFIG = load_config()
+FIRST_NAME = CONFIG.get("first_name", "First")
+LAST_NAME = CONFIG.get("last_name", "Last")
+SUBFOLDER = CONFIG.get("subfolder", "Homework Problems")
+EXAM_SUBFOLDER = CONFIG.get("exam_subfolder", "Exam Problems")
+PDF_MARGIN = CONFIG.get("pdf_margin", "0.5in")
+REMOVE_NOTEBOOK_TITLE_CELL = CONFIG.get("remove_notebook_title_cell", True)
+REMOVE_EXECUTION_PROMPTS = CONFIG.get("remove_execution_prompts", True)
+UNNUMBER_MARKDOWN_HEADINGS = CONFIG.get("unnumber_markdown_headings", True)
+
+
+def reload_globals_from_config(cfg):
+    """Update global variables after config changes."""
+    global FIRST_NAME, LAST_NAME, SUBFOLDER, EXAM_SUBFOLDER, PDF_MARGIN
+    global REMOVE_NOTEBOOK_TITLE_CELL, REMOVE_EXECUTION_PROMPTS, UNNUMBER_MARKDOWN_HEADINGS
+    FIRST_NAME = cfg.get("first_name", "First")
+    LAST_NAME = cfg.get("last_name", "Last")
+    SUBFOLDER = cfg.get("subfolder", "Homework Problems")
+    EXAM_SUBFOLDER = cfg.get("exam_subfolder", "Exam Problems")
+    PDF_MARGIN = cfg.get("pdf_margin", "0.5in")
+    REMOVE_NOTEBOOK_TITLE_CELL = cfg.get("remove_notebook_title_cell", True)
+    REMOVE_EXECUTION_PROMPTS = cfg.get("remove_execution_prompts", True)
+    UNNUMBER_MARKDOWN_HEADINGS = cfg.get("unnumber_markdown_headings", True)
+
+
+# ==============================================================================
+# REAL-TIME STANDALONE & GIT AUTO-UPDATE SYSTEM
+# ==============================================================================
+
+def _is_git_repository():
+    """Check if the script directory is inside a functioning git repository."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False
+        )
+        return res.returncode == 0 and res.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+def check_for_updates(verbose=False):
+    """
+    Check for updates against GitHub and prompt to update.
+    Returns: (is_updated: bool, status: str)
+      status values: 'updated', 'cancelled', 'up_to_date', 'error'
+    """
+    if _is_git_repository():
+        return _check_git_updates(verbose=verbose)
+    else:
+        return _check_standalone_updates(verbose=verbose)
+
+
+def _check_git_updates(verbose=False):
+    """Check and pull updates using real-time Git ls-remote comparison."""
+    try:
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+
+        local_head_res = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=4, env=env, check=False
+        )
+        if local_head_res.returncode != 0:
+            return False, "error"
+        local_sha = local_head_res.stdout.strip()
+
+        if verbose:
+            print(f"[*] Querying live repository {REPO_URL}...")
+
+        ls_res = subprocess.run(
+            ["git", "-C", SCRIPT_DIR, "ls-remote", "origin", "HEAD"],
+            capture_output=True, text=True, timeout=6, env=env, check=False
+        )
+        remote_sha = ""
+        if ls_res.returncode == 0 and ls_res.stdout.strip():
+            remote_sha = ls_res.stdout.split()[0].strip()
+
+        if not remote_sha:
+            ls_res2 = subprocess.run(
+                ["git", "-C", SCRIPT_DIR, "ls-remote", REPO_URL, "HEAD"],
+                capture_output=True, text=True, timeout=6, env=env, check=False
+            )
+            if ls_res2.returncode == 0 and ls_res2.stdout.strip():
+                remote_sha = ls_res2.stdout.split()[0].strip()
+
+        if verbose:
+            print(f"    Local commit:  {local_sha[:7]}")
+            print(f"    Remote commit: {remote_sha[:7] if remote_sha else 'Unknown'}")
+
+        if not remote_sha:
+            if verbose:
+                print("[!] Could not connect to remote repository.")
+            return False, "error"
+
+        if local_sha == remote_sha:
+            return False, "up_to_date"
+
+        print("\n" + "=" * 60)
+        print(f" [!] An update is available on GitHub ({REPO_URL})!")
+        print(f"     Local:  {local_sha[:7]}")
+        print(f"     Remote: {remote_sha[:7]}")
+        print("=" * 60)
+        if _ask_yes_no("[?] Would you like to pull the latest updates now?", default=True):
+            print("[*] Pulling latest updates...")
+            pull_res = subprocess.run(
+                ["git", "-C", SCRIPT_DIR, "pull"],
+                capture_output=True, text=True, timeout=15, env=env, check=False
+            )
+            if pull_res.returncode == 0:
+                print("[SUCCESS] Repository updated successfully!")
+                return True, "updated"
+            else:
+                print(f"[!] Git pull failed: {pull_res.stderr.strip()}")
+                print("    You may have local uncommitted changes.\n")
+                return False, "error"
+        else:
+            print("[*] Update cancelled.")
+            return False, "cancelled"
+
+    except subprocess.TimeoutExpired:
+        if verbose:
+            print("[!] Git network operation timed out.")
+        return False, "error"
+    except Exception as e:
+        if verbose:
+            print(f"[!] Git update error: {e}")
+        return False, "error"
+
+
+def _check_standalone_updates(verbose=False):
+    """
+    Standalone updater: queries GitHub API for latest commit and updates genhw.py directly.
+    Bypasses GitHub Fastly 5-minute CDN cache by querying the commit SHA directly.
+    """
+    try:
+        if verbose:
+            print(f"[*] Checking GitHub API for latest commit ({REPO_API_COMMITS})...")
+
+        req = urllib.request.Request(
+            REPO_API_COMMITS,
+            headers={
+                "User-Agent": "genhw-updater",
+                "Accept": "application/vnd.github.v3+json",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode())
+            remote_sha = data.get("sha", "")
+
+        if not remote_sha:
+            if verbose:
+                print("[!] Could not retrieve commit data from GitHub.")
+            return False, "error"
+
+        sha_file = os.path.join(SCRIPT_DIR, ".version")
+        local_sha = ""
+        if os.path.exists(sha_file):
+            try:
+                with open(sha_file, "r") as f:
+                    local_sha = f.read().strip()
+            except Exception:
+                pass
+
+        raw_url = f"https://raw.githubusercontent.com/moltenlavaguava/genhw/{remote_sha}/genhw.py"
+
+        with open(os.path.abspath(__file__), "r", encoding="utf-8") as f:
+            local_code = f.read()
+
+        needs_update = False
+        if local_sha:
+            needs_update = (local_sha != remote_sha)
+        else:
+            dl_req = urllib.request.Request(raw_url, headers={"User-Agent": "genhw-updater"})
+            with urllib.request.urlopen(dl_req, timeout=8) as dl:
+                remote_code = dl.read().decode("utf-8")
+            needs_update = (remote_code.replace("\r\n", "\n").strip() != local_code.replace("\r\n", "\n").strip())
+
+        if verbose:
+            print(f"    Local version:  {local_sha[:7] if local_sha else 'standalone'}")
+            print(f"    Remote version: {remote_sha[:7]}")
+
+        if needs_update:
+            print("\n" + "=" * 60)
+            print(f" [!] An update is available on GitHub (commit {remote_sha[:7]})!")
+            print("=" * 60)
+            if _ask_yes_no("[?] Update genhw.py directly from GitHub?", default=True):
+                print("[*] Downloading latest genhw.py...")
+                dl_req = urllib.request.Request(raw_url, headers={"User-Agent": "genhw-updater"})
+                with urllib.request.urlopen(dl_req, timeout=10) as dl:
+                    new_code = dl.read().decode("utf-8")
+
+                with open(os.path.abspath(__file__), "w", encoding="utf-8") as f:
+                    f.write(new_code)
+                with open(sha_file, "w") as f:
+                    f.write(remote_sha)
+
+                print("[SUCCESS] genhw.py updated successfully!")
+                return True, "updated"
+            else:
+                print("[*] Update cancelled.")
+                return False, "cancelled"
+        else:
+            if not local_sha:
+                try:
+                    with open(sha_file, "w", encoding="utf-8") as f:
+                        f.write(remote_sha)
+                except Exception:
+                    pass
+            return False, "up_to_date"
+
+    except Exception as e:
+        if verbose:
+            print(f"[!] Standalone update check error: {e}")
+        return False, "error"
 
 
 # Python packages used by this script and by the starter notebook it creates.
@@ -41,6 +338,7 @@ PYTHON_DEPENDENCIES = {
     "numpy": "numpy",
     "pandas": "pandas",
     "matplotlib": "matplotlib",
+    "scipy": "scipy",
 }
 
 
@@ -90,11 +388,34 @@ def _ask_yes_no(prompt, default=True):
         print("Please enter y or n.")
 
 
+def _get_uv_command():
+    """Return command prefix to run 'uv pip install' targeting active Python if available."""
+    if _command_works("uv"):
+        return ["uv", "pip", "install", "--python", sys.executable]
+    if _python_module_works("uv"):
+        return [sys.executable, "-m", "uv", "pip", "install", "--python", sys.executable]
+    return None
+
+
 def _install_python_dependencies(packages):
-    """Install/reinstall Python packages into the interpreter running this script."""
+    """Auto-install Python packages via uv if available, falling back to pip."""
     if not packages:
         return True
-    print("\n[*] Installing Python dependencies...")
+
+    # 1. Try uv first for speed
+    uv_cmd = _get_uv_command()
+    if uv_cmd:
+        print(f"\n[*] Auto-installing Python dependencies using uv: {', '.join(packages)}")
+        try:
+            result = subprocess.run([*uv_cmd, *packages])
+            if result.returncode == 0:
+                return True
+            print("[!] uv install failed; falling back to standard pip...")
+        except Exception as e:
+            print(f"[!] Could not run uv ({e}); falling back to standard pip...")
+
+    # 2. Fallback to pip
+    print(f"\n[*] Installing Python dependencies using pip: {', '.join(packages)}")
     cmd = [sys.executable, "-m", "pip", "install", *packages]
     try:
         result = subprocess.run(cmd)
@@ -195,11 +516,7 @@ def _install_system_dependencies(missing_commands):
 
 
 def ensure_dependencies(require_pdf=False):
-    """Check dependencies and offer to install anything missing or broken.
-
-    The check is intentionally interactive only when something is wrong. A normal
-    working setup starts exactly as before without prompting.
-    """
+    """Check dependencies and auto-install Python packages via uv/pip; prompt for system tools."""
     global nbf
 
     missing_python = [
@@ -214,48 +531,44 @@ def ensure_dependencies(require_pdf=False):
         if not _command_works("xelatex"):
             missing_system.append("xelatex")
 
-    if missing_python or missing_system:
-        print("\n[!] Missing or non-working dependencies detected:")
-        if missing_python:
-            print("    Python packages: " + ", ".join(missing_python))
-        if missing_system:
-            print("    System tools: " + ", ".join(missing_system))
-
-        if not _ask_yes_no("Would you like to install/repair them now?", default=True):
-            print("[!] Dependency setup cancelled.")
-            return False
-
-        if missing_python and not _install_python_dependencies(missing_python):
+    # Auto-install Python packages via uv (or pip) without friction
+    if missing_python:
+        if not _install_python_dependencies(missing_python):
             print("[!] One or more Python dependencies could not be installed.")
             return False
-
-        if missing_system and not _install_system_dependencies(missing_system):
-            return False
-
-        # Invalidate import caches after pip/system installers and verify again.
         importlib.invalidate_caches()
-        still_missing_python = [
-            package for module, package in PYTHON_DEPENDENCIES.items()
-            if not _python_module_works(module)
-        ]
-        still_missing_system = []
-        if require_pdf:
-            if not _command_works("pandoc"):
-                still_missing_system.append("pandoc")
-            if not _command_works("xelatex"):
-                still_missing_system.append("xelatex")
 
-        if still_missing_python or still_missing_system:
-            print("\n[!] Some dependencies are still not available:")
-            if still_missing_python:
-                print("    Python packages: " + ", ".join(still_missing_python))
-            if still_missing_system:
-                print("    System tools: " + ", ".join(still_missing_system))
-                if platform.system().lower() == "windows":
-                    print("    If these were just installed, restart the terminal so PATH updates, then rerun the command.")
+    # Heavy system tools (Pandoc / LaTeX) require system-level privileges; prompt first
+    if missing_system:
+        print("\n[!] Missing system tools for PDF export: " + ", ".join(missing_system))
+        if not _ask_yes_no("Would you like to install/repair them now?", default=True):
+            print("[!] System tool installation cancelled.")
             return False
 
-    # Load nbformat only after the dependency check has had a chance to repair it.
+        if not _install_system_dependencies(missing_system):
+            return False
+
+    still_missing_python = [
+        package for module, package in PYTHON_DEPENDENCIES.items()
+        if not _python_module_works(module)
+    ]
+    still_missing_system = []
+    if require_pdf:
+        if not _command_works("pandoc"):
+            still_missing_system.append("pandoc")
+        if not _command_works("xelatex"):
+            still_missing_system.append("xelatex")
+
+    if still_missing_python or still_missing_system:
+        print("\n[!] Some dependencies are still not available:")
+        if still_missing_python:
+            print("    Python packages: " + ", ".join(still_missing_python))
+        if still_missing_system:
+            print("    System tools: " + ", ".join(still_missing_system))
+            if platform.system().lower() == "windows":
+                print("    If these were just installed, restart the terminal so PATH updates, then rerun the command.")
+        return False
+
     if nbf is None:
         nbf = importlib.import_module("nbformat")
     return True
@@ -263,8 +576,6 @@ def ensure_dependencies(require_pdf=False):
 
 def cleanup_temp_artifacts(temp_base):
     """Remove every temporary file/folder created for one notebook conversion."""
-    # nbconvert may create __tmp_name.tex/.pdf/.aux/.log plus a
-    # __tmp_name_files directory containing extracted figures.
     for path in glob.glob(temp_base + "*"):
         try:
             if os.path.isdir(path) and not os.path.islink(path):
@@ -276,13 +587,16 @@ def cleanup_temp_artifacts(temp_base):
         except Exception as e:
             print(f"    [!] Could not remove temporary artifact '{path}': {e}")
 
-def get_base_path():
+
+def get_base_path(exam=False):
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if SUBFOLDER.strip():
-        path = os.path.join(script_dir, SUBFOLDER.strip())
+    subfolder = EXAM_SUBFOLDER if exam else SUBFOLDER
+    if subfolder.strip():
+        path = os.path.join(script_dir, subfolder.strip())
         os.makedirs(path, exist_ok=True)
         return path
     return script_dir
+
 
 def get_pandoc_path():
     """Finds the Pandoc executable used by nbconvert."""
@@ -292,6 +606,7 @@ def get_pandoc_path():
     except Exception:
         import shutil
         return shutil.which("pandoc") or "pandoc"
+
 
 def sanitize_latex(text):
     """Escape LaTeX special characters in plain text using a single pass."""
@@ -316,7 +631,6 @@ def sanitize_latex_preserving_math(text):
     """Escape title text while preserving inline LaTeX math such as $\\pi$."""
     if not text:
         return ""
-    # Keep $...$ and \\(...\\) math untouched; escape only surrounding text.
     parts = re.split(r'(\$[^$]*\$|\\\([^)]*\\\))', text)
     out = []
     for part in parts:
@@ -327,12 +641,10 @@ def sanitize_latex_preserving_math(text):
     return ''.join(out)
 
 
-
 def _html_inline_to_markdown(text):
     """Translate a conservative set of inline HTML tags to Markdown/raw TeX."""
     if not text:
         return text
-    # These preserve formatting without changing surrounding text/layout.
     text = re.sub(r'<\s*(?:b|strong)\s*>', '**', text, flags=re.IGNORECASE)
     text = re.sub(r'<\s*/\s*(?:b|strong)\s*>', '**', text, flags=re.IGNORECASE)
     text = re.sub(r'<\s*(?:i|em)\s*>', '*', text, flags=re.IGNORECASE)
@@ -366,12 +678,7 @@ def _markdown_fragment_to_latex(text):
 
 
 def preserve_markdown_html_formatting(text):
-    """Preserve common HTML presentation tags when exporting Markdown to PDF.
-
-    nbconvert/Pandoc normally discards HTML-only alignment such as <center>
-    and CSS text-align. Only cells that actually contain these HTML tags are
-    touched; ordinary notebook Markdown is left byte-for-byte unchanged.
-    """
+    """Preserve common HTML presentation tags when exporting Markdown to PDF."""
     if not text or '<' not in text:
         return text
 
@@ -385,7 +692,6 @@ def preserve_markdown_html_formatting(text):
             '```\n'
         )
 
-    # Legacy <center>...</center>.
     text = re.sub(
         r'<\s*center\s*>([\s\S]*?)<\s*/\s*center\s*>',
         lambda m: latex_raw_block('center', m.group(1)),
@@ -393,7 +699,6 @@ def preserve_markdown_html_formatting(text):
         flags=re.IGNORECASE,
     )
 
-    # <div>/<p> with align="..." or style="text-align: ...".
     pair_pattern = re.compile(
         r'<(?P<tag>div|p)\b(?P<attrs>[^>]*)>(?P<body>[\s\S]*?)</\s*(?P=tag)\s*>',
         flags=re.IGNORECASE,
@@ -420,13 +725,33 @@ def preserve_markdown_html_formatting(text):
         return latex_raw_block(env, match.group('body'))
 
     text = pair_pattern.sub(replace_aligned_pair, text)
-
-    # Preserve common inline HTML formatting outside alignment blocks too.
     text = _html_inline_to_markdown(text)
-
-    # Horizontal rules are already understood by Markdown; convert HTML <hr>.
     text = re.sub(r'<\s*hr\s*/?\s*>', '\n\n---\n\n', text, flags=re.IGNORECASE)
     return text
+
+# Regions that must never be modified: fenced code, inline code, display math.
+_PROTECTED_MD = re.compile(r'(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`|\$\$[\s\S]*?\$\$)')
+_INLINE_MATH = re.compile(r'(?<![\\$])\$(?!\$)([^$\n]+?)(?<!\\)\$(?!\$)')
+_MATHY = re.compile(r'[\\^_{}=]')
+
+
+def normalize_inline_math_spacing(text):
+
+    if not text or '$' not in text:
+        return text
+
+    def repl(m):
+        inner = m.group(1)
+        stripped = inner.strip()
+        if inner != stripped and stripped and _MATHY.search(stripped):
+            return f'${stripped}$'
+        return m.group(0)
+
+    parts = _PROTECTED_MD.split(text)
+    # Even indices are ordinary text; odd indices are protected regions.
+    for i in range(0, len(parts), 2):
+        parts[i] = _INLINE_MATH.sub(repl, parts[i])
+    return ''.join(parts)
 
 def scan_notebook_for_problems(nb_path):
     """Pre-flight scan for layout risks that Pandoc cannot always fix automatically."""
@@ -441,10 +766,10 @@ def scan_notebook_for_problems(nb_path):
     for i, cell in enumerate(nb.cells):
         if cell.cell_type != 'markdown':
             continue
-        # Markdown tables with many columns are the main predictable PDF layout risk.
         for line in cell.source.splitlines():
             if line.strip().startswith('|') and line.count('|') > 8:
                 warnings.append(f"Cell {i}: Wide Markdown table detected; it may need wrapping.")
+                break
 
     if warnings:
         print(f"\n[!] PRE-FLIGHT WARNINGS for {os.path.basename(nb_path)}:")
@@ -452,18 +777,15 @@ def scan_notebook_for_problems(nb_path):
             print(f"    - {w}")
         print("-" * 40)
 
+
 def extract_title_and_author(nb, filename, override_title=None):
-    """
-    Safely extracts Title and Author with a multi-level fallback cascade.
-    Never returns None. Never leaves raw __tmp_ filenames.
-    """
+    """Safely extracts Title and Author with a multi-level fallback cascade."""
     if override_title:
         return override_title, f"{FIRST_NAME} {LAST_NAME}"
 
     title = None
     author = None
 
-    # LEVEL 1: Try to extract from the first markdown cell
     for cell in nb.cells:
         if cell.cell_type == 'markdown':
             lines = [l.strip() for l in cell.source.splitlines() if l.strip()]
@@ -476,29 +798,27 @@ def extract_title_and_author(nb, filename, override_title=None):
             if title:
                 break
 
-    # LEVEL 2: Try to parse structured filename (e.g., Jacob_Turley_HW2_Problem01)
     if not title or not author:
         base = os.path.splitext(os.path.basename(filename))[0]
         base = re.sub(r'^_+tmp_+', '', base, flags=re.IGNORECASE)
         parts = base.split('_')
         
-        if len(parts) >= 4 and 'HW' in parts[2]:
+        if len(parts) >= 4 and re.fullmatch(r'(HW|Exam)\d+', parts[2], re.IGNORECASE):
             author = author or f"{parts[0]} {parts[1]}"
-            hw = parts[2].replace('HW', 'Homework ')
+            hw = re.sub(r'^(HW|Exam)', lambda m: 'Homework ' if m[0].lower() == 'hw' else 'Exam ', parts[2], flags=re.IGNORECASE)
             prob_num = re.sub(r'(?i)^Problem0*', '', parts[3])
             prob = f"Problem {prob_num}"
             title = title or f"{hw}: {prob}"
         else:
-            # LEVEL 3: Clean generic filename (e.g., lab_experiment_final -> Lab Experiment Final)
             clean_base = base.replace('_', ' ').replace('-', ' ').strip().title()
             title = title or (clean_base if clean_base else "Homework Submission")
             author = author or f"{FIRST_NAME} {LAST_NAME}"
 
-    # LEVEL 4: Absolute safe default
     final_title = title if title else "Homework Submission"
     final_author = author if author else f"{FIRST_NAME} {LAST_NAME}"
 
     return final_title, final_author
+
 
 def prepare_notebook_for_pdf(nb):
     """Clean a temporary notebook copy for PDF export without altering the original."""
@@ -509,17 +829,13 @@ def prepare_notebook_for_pdf(nb):
             has_title = any(line.startswith('# ') for line in lines)
             has_author = any(line.startswith('**') and line.endswith('**') for line in lines)
             if has_title and has_author:
-                # The same title/author are already inserted with LaTeX's \\maketitle.
                 nb.cells.pop(0)
 
-    # Preserve presentation-oriented HTML in Markdown cells for PDF export.
-    # This only modifies the temporary export copy, never the original notebook.
     for cell in nb.cells:
         if cell.cell_type == 'markdown':
+            cell.source = normalize_inline_math_spacing(cell.source)
             cell.source = preserve_markdown_html_formatting(cell.source)
 
-    # Remove useless object reprs like <matplotlib.legend.Legend at 0x...> while
-    # retaining the actual plot image output.
     noisy_repr = re.compile(r'^<matplotlib\.[^>]+ at 0x[0-9A-Fa-f]+>$')
     for cell in nb.cells:
         if cell.cell_type != 'code':
@@ -531,11 +847,9 @@ def prepare_notebook_for_pdf(nb):
             if isinstance(text_plain, list):
                 text_plain = ''.join(text_plain)
             if isinstance(text_plain, str) and noisy_repr.match(text_plain.strip()):
-                # If this output contains an image too, keep it but remove the text repr.
                 if any(k.startswith('image/') for k in data):
                     data.pop('text/plain', None)
                     cleaned.append(output)
-                # Otherwise drop only this noisy execute/display result.
                 continue
             cleaned.append(output)
         cell['outputs'] = cleaned
@@ -573,20 +887,12 @@ def convert_html_tables_to_latex(nb):
                     if res.returncode == 0 and res.stdout.strip():
                         latex = res.stdout
 
-                        # Pandas Styler puts captions in the table HTML, but the
-                        # nbconvert LaTeX template globally suppresses normal
-                        # LaTeX captions. Render the HTML caption ourselves so
-                        # it is visible and its basic CSS placement/alignment is
-                        # respected without changing any other PDF formatting.
                         caption_match = re.search(
                             r'<caption[^>]*>([\s\S]*?)</caption>',
                             html_str,
                             re.IGNORECASE,
                         )
                         if caption_match:
-                            # Pandoc has already converted the caption text to
-                            # LaTeX for us; reuse that converted text so symbols
-                            # and escaping stay consistent with the table.
                             latex_caption = re.search(
                                 r'\\caption\{([\s\S]*?)\}\\label\{[^}]*\}\\tabularnewline',
                                 latex,
@@ -608,31 +914,24 @@ def convert_html_tables_to_latex(nb):
                                 rendered_caption = caption_text
                                 if bold:
                                     rendered_caption = rf'\textbf{{{rendered_caption}}}'
-                                if centered:
-                                    rendered_caption = (
-                                        '\n\\begin{center}\n'
-                                        + rendered_caption
-                                        + '\n\\end{center}\n'
-                                    )
-                                else:
-                                    rendered_caption = '\n' + rendered_caption + '\n'
+                                alignment = r'\centering ' if centered else r'\raggedright '
+                                rendered_caption = alignment + rendered_caption
 
                                 if caption_side == 'bottom':
-                                    latex = latex.replace(
-                                        r'\end{longtable}',
-                                        r'\end{longtable}' + rendered_caption,
-                                        1,
-                                    )
+                                    marker = r'\GenhwBottomCaption{' + rendered_caption + '}'
+                                    latex = latex.replace(r'\endlastfoot', marker + '\n' + r'\endlastfoot', 1)
                                 else:
-                                    latex = rendered_caption + latex
+                                    marker = r'\GenhwTopCaption{' + rendered_caption + '}'
+                                    latex = latex.replace(r'\toprule', marker + '\n' + r'\toprule', 1)
 
                         data['text/latex'] = latex
                 except Exception:
                     pass
 
+
 def patch_latex(tex_content, title, author):
     """Clean document metadata, headings, margins, code layout, and wide tables."""
-    # 1. Fix Python/nbconvert counter issue. Use a real newline, not a literal "\\n".
+    # 1. Fix Python/nbconvert counter issue.
     if r"\newcounter{none}" not in tex_content:
         tex_content = tex_content.replace(
             r"\begin{document}",
@@ -640,8 +939,7 @@ def patch_latex(tex_content, title, author):
             1,
         )
 
-    # 2. Make the page geometry deterministic. nbconvert often emits a later
-    #    \\geometry{...} command that otherwise overrides package options.
+    # 2. Make the page geometry deterministic.
     if r"\usepackage{array}" not in tex_content:
         tex_content = tex_content.replace(
             r"\usepackage{geometry}",
@@ -654,7 +952,6 @@ def patch_latex(tex_content, title, author):
         tex_content,
         count=1,
     )
-    # Prevent LaTeX from vertically stretching sparse pages.
     tex_content = tex_content.replace(r"\begin{document}", r"\begin{document}" + "\n" + r"\raggedbottom", 1)
 
     # 3. Clean and format document title/author. Preserve inline title math.
@@ -684,57 +981,140 @@ def patch_latex(tex_content, title, author):
     else:
         tex_content = tex_content.replace(r'\maketitle', f"\\author{{{esc_author}}}\n\\maketitle", 1)
 
-    # 4. The notebook questions already contain their own problem numbers.
-    #    Star LaTeX section commands to stop nbconvert from adding 1, 1.1, 1.1.1, etc.
+    # 4. Heading unnumbering.
     if UNNUMBER_MARKDOWN_HEADINGS:
         for cmd in ('section', 'subsection', 'subsubsection', 'paragraph', 'subparagraph'):
             tex_content = re.sub(rf'\\{cmd}(?!\*)\{{', rf'\\{cmd}*{{', tex_content)
 
-    # 5. Wrap Pandas/Pandoc longtables. Pandoc column specs contain nested @{}
-    #    tokens, so the old "[^}]" regex stopped at the first brace and never worked.
-    table_pattern = re.compile(
-        r'\\begin\{longtable\}\[\]\{([^\n]*)\}([\s\S]*?)\\end\{longtable\}'
-    )
+    return fit_longtables(tex_content)
 
-    def fit_longtable(match):
-        old_spec = match.group(1)
-        body = match.group(2)
-        # Remove Pandoc spacing decorators before counting alignment columns.
-        stripped = re.sub(r'@\{[^}]*\}', '', old_spec)
-        num_cols = len(re.findall(r'(?<!\\)[lcrX]', stripped))
-        if num_cols <= 0:
-            return match.group(0)
 
-        # Leave narrow tables close to normal size; wrap wider tables aggressively.
-        if num_cols <= 3:
-            size = r'\normalsize'
-            total_fraction = 0.90
-            tabcolsep = '4pt'
-        elif num_cols <= 6:
-            size = r'\footnotesize'
-            total_fraction = 0.86
-            tabcolsep = '2.5pt'
+def brace_end(text, start):
+    """Return the index after a balanced {...} group, or raise ValueError."""
+    if start >= len(text) or text[start] != '{':
+        raise ValueError("Expected opening brace")
+    depth = 0
+    i = start
+    while i < len(text):
+        if text[i] == '\\':
+            i += 2
+            continue
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise ValueError("Unclosed brace group")
+
+
+def column_count(spec):
+    """Count top-level standard columns, ignoring width/decorator contents."""
+    count = 0
+    i = 0
+    while i < len(spec):
+        char = spec[i]
+        if char.isspace() or char == '|':
+            i += 1
+            continue
+        if char in '@!><':
+            i += 1
+            while i < len(spec) and spec[i].isspace():
+                i += 1
+            i = brace_end(spec, i)
+        elif char in 'lcrXpmb':
+            count += 1
+            i += 1
+            if char in 'pmb':
+                while i < len(spec) and spec[i].isspace():
+                    i += 1
+                i = brace_end(spec, i)
+        elif char == '*':
+            i += 1
+            while i < len(spec) and spec[i].isspace():
+                i += 1
+            end = brace_end(spec, i)
+            repeats = int(spec[i + 1:end - 1])
+            i = end
+            while i < len(spec) and spec[i].isspace():
+                i += 1
+            end = brace_end(spec, i)
+            count += repeats * column_count(spec[i + 1:end - 1])
+            i = end
         else:
-            size = r'\scriptsize'
-            total_fraction = 0.82
-            tabcolsep = '2pt'
+            raise ValueError("Unsupported custom column type")
+    return count
 
-        width = total_fraction / num_cols
-        new_spec = ''.join(
-            rf'>{{\raggedright\arraybackslash}}p{{{width:.4f}\textwidth}}'
+
+def fit_longtables(text):
+    """Fit standard longtables and keep HTML captions in their header/footer."""
+    opening = re.compile(r'\\begin\{longtable\}(?:\[[^\]]*\])?\s*\{')
+    ending = r'\end{longtable}'
+    replacements = []
+    for match in opening.finditer(text):
+        try:
+            end_spec = brace_end(text, match.end() - 1)
+            num_cols = column_count(text[match.end():end_spec - 1])
+            end_table = text.index(ending, end_spec)
+            if num_cols < 1:
+                continue
+        except ValueError:
+            continue
+        body = text[end_spec:end_table]
+        for command in ('GenhwTopCaption', 'GenhwBottomCaption'):
+            marker = '\\' + command + '{'
+            while marker in body:
+                start = body.index(marker)
+                end = brace_end(body, start + len(marker) - 1)
+                caption = body[start + len(marker):end - 1]
+                row = (rf'\multicolumn{{{num_cols}}}{{c}}{{'
+                       rf'\parbox{{0.94\linewidth}}{{\normalfont {caption}\par}}}}'
+                       + r'\\*[0.5em]')
+                body = body[:start] + row + body[end:]
+        if num_cols <= 3:
+            size, spacing = r'\normalsize', '4pt'
+        elif num_cols <= 6:
+            size, spacing = r'\footnotesize', '2.5pt'
+        else:
+            size, spacing = r'\scriptsize', '2pt'
+        width = 0.96 / num_cols
+        spec = ''.join(
+            rf'>{{\raggedright\arraybackslash}}p{{\dimexpr {width:.6f}\linewidth-2\tabcolsep\relax}}'
             for _ in range(num_cols)
         )
-        return (
-            "\\begingroup\n"
-            f"{size}\n"
-            f"\\setlength{{\\tabcolsep}}{{{tabcolsep}}}\n"
-            "\\renewcommand{\\arraystretch}{1.05}\n"
-            f"\\begin{{longtable}}[]{{{new_spec}}}{body}\\end{{longtable}}\n"
-            "\\endgroup"
+        replacement = (
+            '\\begingroup\n' + size + '\n'
+            + rf'\setlength{{\tabcolsep}}{{{spacing}}}' + '\n'
+            + r'\renewcommand{\arraystretch}{1.05}' + '\n'
+            + rf'\begin{{longtable}}[]{{{spec}}}' + body + ending
+            + '\n\\endgroup'
         )
+        replacements.append((match.start(), end_table + len(ending), replacement))
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+    return text
 
-    tex_content = table_pattern.sub(fit_longtable, tex_content)
-    return tex_content
+
+def compile_pdf(temp_tex, target_dir, max_passes=3):
+    """Rerun XeLaTeX only when its output requests another pass."""
+    rerun = re.compile(
+        r'rerun to get|label\(s\) may have changed|rerun to get cross-references|'
+        r'table widths have changed|rerun LaTeX|Please \(re\)run', re.IGNORECASE
+    )
+    for pass_number in range(1, max_passes + 1):
+        print(f"    [*] Compiling PDF (pass {pass_number}/{max_passes})...", flush=True)
+        result = subprocess.run(
+            ["xelatex", "-interaction=nonstopmode", "-halt-on-error",
+             "-output-directory=" + target_dir, os.path.basename(temp_tex)],
+            cwd=target_dir, capture_output=True, text=True,
+        )
+        log = (result.stdout or '') + '\n' + (result.stderr or '')
+        if result.returncode != 0 or not rerun.search(log):
+            return result
+    print("    [!] LaTeX still requests another pass; review references/table widths.")
+    return result
+
 
 def process_single_file(ipynb_path, override_title=None, debug=False):
     """Converts a notebook to PDF with clean title, pandas tables, and LaTeX patches."""
@@ -759,15 +1139,15 @@ def process_single_file(ipynb_path, override_title=None, debug=False):
         with open(ipynb_path, 'r', encoding='utf-8') as f:
             nb = nbf.read(f, as_version=4)
 
-        # Extract metadata before removing the duplicate title cell from the temporary copy.
         doc_title, doc_author = extract_title_and_author(nb, ipynb_path, override_title)
+        print("    [*] Preparing notebook and converting HTML tables...", flush=True)
         nb = prepare_notebook_for_pdf(nb)
         convert_html_tables_to_latex(nb)
 
         with open(temp_ipynb, 'w', encoding='utf-8') as f:
             nbf.write(nb, f)
 
-        # Convert to LaTeX
+        print("    [*] Converting notebook to LaTeX...", flush=True)
         convert_res = subprocess.run(
             [
                 sys.executable, "-m", "nbconvert", "--to", "latex",
@@ -786,21 +1166,14 @@ def process_single_file(ipynb_path, override_title=None, debug=False):
             print("    [FAILED] .tex file was not created.")
             return
 
-        # Patch LaTeX
+        print("    [*] Formatting tables, captions, and page layout...", flush=True)
         with open(temp_tex, 'r', encoding='utf-8') as f:
             patched = patch_latex(f.read(), doc_title, doc_author)
         with open(temp_tex, 'w', encoding='utf-8') as f:
             f.write(patched)
 
-        # Compile with xelatex
-        pdf_res = subprocess.run(
-            ["xelatex", "-interaction=nonstopmode", "-halt-on-error", "-output-directory=" + target_dir, os.path.basename(temp_tex)],
-            cwd=target_dir,
-            capture_output=True, text=True
-        )
+        pdf_res = compile_pdf(temp_tex, target_dir)
 
-        # xelatex can leave a partial/corrupt PDF behind on failure, so require
-        # both a zero return code and a non-empty output file.
         pdf_ok = (
             pdf_res.returncode == 0
             and os.path.exists(temp_pdf)
@@ -821,17 +1194,17 @@ def process_single_file(ipynb_path, override_title=None, debug=False):
     except Exception as e:
         print(f"    [ERROR] {e}")
     finally:
-        # Always clean temporary files/folders unless debug mode was explicitly
-        # requested. This also removes failed/partial PDFs and extracted image
-        # folders left behind by nbconvert or XeLaTeX.
         if not debug:
             cleanup_temp_artifacts(temp_base)
         else:
             print(f"    [DEBUG] Temporary artifacts preserved at: {temp_base}*")
 
-def create_notebooks(hw_num, num_problems):
-    base_dir = get_base_path()
-    target_path = os.path.join(base_dir, f"HW{hw_num}")
+
+def create_notebooks(hw_num, num_problems, exam=False):
+    label = "Exam" if exam else "Homework"
+    prefix = "Exam" if exam else "HW"
+    base_dir = get_base_path(exam=exam)
+    target_path = os.path.join(base_dir, f"{prefix}{hw_num}")
     os.makedirs(target_path, exist_ok=True)
     
     overwrite_all = False
@@ -839,15 +1212,17 @@ def create_notebooks(hw_num, num_problems):
 
     starter_code = (
         "# Setup & settings\n"
+        "import math\n"
         "import numpy as np\n"
+        "from scipy.optimize import fsolve\n"
         "import matplotlib.pyplot as plt\n"
         "import pandas as pd\n\n"
-        "# Ensures pandas Styler tables export directly to LaTeX/PDF\n"
-        "pd.set_option('styler.render.repr', 'latex')\n"
+        "# Display tables in VS Code; genhw.py converts HTML tables for PDF.\n"
+        "pd.set_option('styler.render.repr', 'html')\n"
     )
 
     for i in range(1, num_problems + 1):
-        filename = f"{FIRST_NAME}_{LAST_NAME}_HW{hw_num}_Problem{i:02d}.ipynb"
+        filename = f"{FIRST_NAME}_{LAST_NAME}_{prefix}{hw_num}_Problem{i:02d}.ipynb"
         filepath = os.path.join(target_path, filename)
 
         if os.path.exists(filepath) and not overwrite_all and not skip_all:
@@ -860,57 +1235,149 @@ def create_notebooks(hw_num, num_problems):
 
         nb = nbf.v4.new_notebook()
         cells = [
-            nbf.v4.new_markdown_cell(f"# Homework {hw_num}: Problem {i} - *Problem Title*\n**{FIRST_NAME} {LAST_NAME}**"),
+            nbf.v4.new_markdown_cell(f"# {label} {hw_num}: Problem {i} - *Problem Title*\n**{FIRST_NAME} {LAST_NAME}**"),
             nbf.v4.new_markdown_cell("(statement)"),
             nbf.v4.new_markdown_cell("## Solution"),
             nbf.v4.new_code_cell(starter_code),
-            nbf.v4.new_markdown_cell("## Discussion\n\nAI Declaration: (declaration)\n\n(discussion)")
+            nbf.v4.new_markdown_cell(
+                "## Discussion\n\n(discussion)" if exam else
+                "## Discussion\n\nAI Declaration: (declaration)\n\n(discussion)"
+            )
         ]
         nb['cells'] = cells
         with open(filepath, 'w', encoding='utf-8') as f:
             nbf.write(nb, f)
         print(f"  + Generated: {filename}")
 
+
+def positive_int(value):
+    """Reject invalid numbers before checking dependencies or creating folders."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+# ==============================================================================
+# CLI INTERFACE
+# ==============================================================================
+
 def main():
-    parser = argparse.ArgumentParser(description="Resilient HW CLI Tool")
+    # Base parser shared with all commands so --skip-update is accepted anywhere
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument("--skip-update", action="store_true", help="Skip checking for updates")
+
+    parser = argparse.ArgumentParser(
+        description="Homework and Exam Notebook/PDF Tool",
+        parents=[base_parser]
+    )
     subparsers = parser.add_subparsers(dest="command")
 
-    gen = subparsers.add_parser('gen')
-    gen.add_argument('-hw', '--hw_num', type=str, required=True)
-    gen.add_argument('-n', '--num', type=int, required=True)
+    gen = subparsers.add_parser('gen', parents=[base_parser], help="Create problem notebook templates")
+    gen_target = gen.add_mutually_exclusive_group(required=True)
+    gen_target.add_argument('-hw', '--hw_num', type=positive_int, help='Homework number')
+    gen_target.add_argument('-exam', '--exam', '--exam_num', dest='exam_num', type=positive_int, help='Exam number')
+    gen.add_argument('-n', '--num', type=positive_int, required=True, help='Number of problem notebooks to create')
 
-    pdf = subparsers.add_parser('pdf')
-    pdf.add_argument('-hw', '--hw_num', type=str)
-    pdf.add_argument('-m', '--manual', type=str)
+    pdf = subparsers.add_parser('pdf', parents=[base_parser], help="Export notebooks to PDF")
+    pdf_target = pdf.add_mutually_exclusive_group(required=True)
+    pdf_target.add_argument('-hw', '--hw_num', type=positive_int, help='Export a homework folder')
+    pdf_target.add_argument('-exam', '--exam', '--exam_num', dest='exam_num', type=positive_int, help='Export an exam folder')
+    pdf_target.add_argument('-m', '--manual', type=str, help='Export one notebook by path')
     pdf.add_argument('-t', '--title', type=str, help='Manually override document title')
-    pdf.add_argument('-d', '--debug', action='store_true')
+    pdf.add_argument('-d', '--debug', action='store_true', help='Preserve intermediate LaTeX files')
+
+    # Command: config
+    cfg_cmd = subparsers.add_parser('config', parents=[base_parser], help="View or modify user configuration")
+    cfg_cmd.add_argument('--set', nargs='+', help="Set config values (e.g. --set first_name=Alice subfolder='Homework')")
+
+    # Command: update
+    subparsers.add_parser('update', parents=[base_parser], help="Force check and pull updates from GitHub")
 
     args = parser.parse_args()
 
-    # Check only after argument parsing so --help still works even on a fresh
-    # machine. PDF conversion additionally requires Pandoc and XeLaTeX.
+    # Load configuration from genhw_config.json
+    cfg = load_config()
+    reload_globals_from_config(cfg)
+
+    # Explicit update command
+    if args.command == 'update':
+        updated, status = check_for_updates(verbose=True)
+        if status == "up_to_date":
+            print("[*] genhw is already up to date.")
+        return
+
+    # Automatic update check (with instant command resume)
+    if cfg.get("check_updates", True) and not args.skip_update and args.command != 'config':
+        updated, status = check_for_updates(verbose=False)
+        if updated:
+            # Place --skip-update right after the script name before subcommands
+            clean_args = ["--skip-update"] + [arg for arg in sys.argv[1:] if arg != "--skip-update"]
+            print("[*] Resuming command with updated version...\n")
+            try:
+                res = subprocess.run([sys.executable, os.path.abspath(__file__), *clean_args])
+                sys.exit(res.returncode)
+            except Exception as e:
+                print(f"[!] Error resuming command: {e}")
+                sys.exit(1)
+
+    # Config command handler
+    if args.command == 'config':
+        if args.set:
+            for item in args.set:
+                if '=' in item:
+                    k, v = item.split('=', 1)
+                    k, v = k.strip(), v.strip()
+                    if v.lower() in ("true", "yes", "1"):
+                        cfg[k] = True
+                    elif v.lower() in ("false", "no", "0"):
+                        cfg[k] = False
+                    else:
+                        cfg[k] = v
+            save_config(cfg)
+            reload_globals_from_config(cfg)
+        else:
+            print(f"\nCurrent Configuration ({CONFIG_FILE}):")
+            print(json.dumps(cfg, indent=4))
+            print(f"\nModify via: python genhw.py config --set first_name=YourName\n")
+        return
+
+    # Check dependencies only for commands that need them
     if args.command in ('gen', 'pdf'):
         if not ensure_dependencies(require_pdf=(args.command == 'pdf')):
             return
 
     if args.command == 'gen':
-        create_notebooks(args.hw_num, args.num)
+        exam = args.exam_num is not None
+        create_notebooks(args.exam_num if exam else args.hw_num, args.num, exam=exam)
     elif args.command == 'pdf':
         if args.manual:
             process_single_file(args.manual, override_title=args.title, debug=args.debug)
-        elif args.hw_num:
-            base_dir = get_base_path()
-            target_dir = os.path.join(base_dir, f"HW{args.hw_num}")
+        elif args.hw_num is not None or args.exam_num is not None:
+            exam = args.exam_num is not None
+            prefix = "Exam" if exam else "HW"
+            number = args.exam_num if exam else args.hw_num
+            base_dir = get_base_path(exam=exam)
+            target_dir = os.path.join(base_dir, f"{prefix}{number}")
             if not os.path.exists(target_dir):
                 print(f"[!] Folder {target_dir} not found.")
                 return
-            files = sorted([f for f in os.listdir(target_dir) if f.endswith('.ipynb')])
+            files = sorted(f for f in os.listdir(target_dir)
+                           if f.lower().endswith('.ipynb')
+                           and not f.lower().startswith('__tmp_')
+                           and os.path.isfile(os.path.join(target_dir, f)))
+            if not files:
+                print(f"[!] No notebooks found in {target_dir}.")
             for f in files:
                 process_single_file(os.path.join(target_dir, f), override_title=args.title, debug=args.debug)
         else:
-            print("[!] Provide -hw or -m")
+            print("[!] Provide -hw, -exam, or -m")
     else:
         parser.print_help()
+
 
 if __name__ == "__main__":
     main()
