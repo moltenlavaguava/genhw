@@ -48,7 +48,7 @@ DEFAULT_CONFIG = {
     "remove_notebook_title_cell": True,
     "remove_execution_prompts": True,
     "unnumber_markdown_headings": True,
-    "check_updates": True,
+    "check_updates": False,
 }
 
 
@@ -341,6 +341,67 @@ PYTHON_DEPENDENCIES = {
     "scipy": "scipy",
 }
 
+# LaTeX style files nbconvert's default template can pull in (e.g. `soul`/`ulem`
+# for pandoc's strikethrough support) that a *minimal* TeX install may be
+# missing even though xelatex itself runs fine. Maps style file -> apt package.
+# On apt systems this is auto-installed like pandoc/xelatex; on other platforms
+# a full TeX Live/MacTeX/MiKTeX install (or MiKTeX's on-the-fly package
+# fetching) already covers this, so we just check apt-based Linux here.
+LATEX_STYLE_FILES = {
+    "ulem.sty": "texlive-plain-generic",
+}
+
+# The CTAN/package name for the same style file, as understood by TeX's own
+# package managers (tlmgr for TeX Live, MiKTeX's console/mpm for MiKTeX).
+# These work identically on Windows/macOS/Linux and only touch the one
+# missing package, so they're tried before falling back to an OS package
+# manager that would otherwise have nothing to do (see _system_install_command).
+TEX_PACKAGE_MANAGER_NAMES = {
+    "ulem.sty": "ulem",
+}
+
+
+def _tex_native_install_command(missing_styles):
+    """
+    Prefer TeX's own package manager (tlmgr / MiKTeX) for missing style files.
+
+    This matters because the OS-level branches below only know how to install
+    pandoc/xelatex themselves; when those already work and only a style file
+    is missing, asking winget/brew to do anything would be a no-op. tlmgr and
+    MiKTeX's CLI are the actual right tool for "fetch one missing package" and
+    exist the same way across Windows, macOS and Linux TeX Live installs.
+    """
+    if not missing_styles:
+        return None, None
+    packages = [TEX_PACKAGE_MANAGER_NAMES[s] for s in missing_styles if s in TEX_PACKAGE_MANAGER_NAMES]
+    if not packages:
+        return None, None
+    if shutil.which("tlmgr"):
+        prefix = ["sudo"] if platform.system().lower() != "windows" and shutil.which("sudo") else []
+        return [prefix + ["tlmgr", "install", *packages]], "tlmgr"
+    if shutil.which("miktex"):
+        return [["miktex", "packages", "install", *packages]], "MiKTeX"
+    if shutil.which("mpm"):
+        return [["mpm", f"--install={p}"] for p in packages], "MiKTeX Package Manager"
+    return None, None
+
+
+def _kpsewhich_finds(style_file):
+    """Return True if the LaTeX package manager can locate a style file."""
+    kpsewhich = shutil.which("kpsewhich")
+    if not kpsewhich:
+        # No kpsewhich available to check with; don't block on it here, the
+        # xelatex command-existence check already covers a missing TeX install.
+        return True
+    try:
+        result = subprocess.run(
+            [kpsewhich, style_file],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        return result.returncode == 0 and result.stdout.strip() != ""
+    except Exception:
+        return True
+
 
 def _command_works(command, version_args=("--version",)):
     """Return True only when a command exists and can actually run."""
@@ -426,10 +487,33 @@ def _install_python_dependencies(packages):
 
 
 def _system_install_command(missing_commands):
-    """Return a platform/package-manager install command for Pandoc/XeLaTeX."""
+    """Return a platform/package-manager install command for Pandoc/XeLaTeX/style files."""
+    commands, manager = _system_install_command_impl(missing_commands)
+    # Guard against a branch returning a real manager name paired with an
+    # empty command list (e.g. only a style file is missing and that OS
+    # branch only knows how to install pandoc/xelatex) -- callers treat
+    # `not commands` as "no installer available", so normalize that here
+    # instead of at every call site.
+    if not commands:
+        return None, None
+    return commands, manager
+
+
+def _system_install_command_impl(missing_commands):
     system = platform.system().lower()
     need_pandoc = "pandoc" in missing_commands
     need_xelatex = "xelatex" in missing_commands
+    # Anything in missing_commands that isn't "pandoc"/"xelatex" is a missing
+    # LaTeX style file (e.g. "ulem.sty"), keyed against LATEX_STYLE_FILES.
+    missing_styles = [m for m in missing_commands if m not in ("pandoc", "xelatex")]
+
+    # If pandoc/xelatex already work and only a style file is missing, use
+    # TeX's own package manager rather than an OS package manager that has
+    # no actual work to do for that case (see _tex_native_install_command).
+    if missing_styles and not need_pandoc and not need_xelatex:
+        commands, manager = _tex_native_install_command(missing_styles)
+        if commands:
+            return commands, manager
 
     if system == "windows":
         if shutil.which("winget"):
@@ -469,6 +553,10 @@ def _system_install_command(missing_commands):
                 packages.append("pandoc")
             if need_xelatex:
                 packages.extend(["texlive-xetex", "texlive-fonts-recommended", "texlive-plain-generic"])
+            for style in missing_styles:
+                pkg = LATEX_STYLE_FILES.get(style)
+                if pkg and pkg not in packages:
+                    packages.append(pkg)
             prefix = ["sudo"] if shutil.which("sudo") else []
             return [
                 prefix + ["apt-get", "update"],
@@ -480,6 +568,10 @@ def _system_install_command(missing_commands):
                 packages.append("pandoc")
             if need_xelatex:
                 packages.extend(["texlive-xetex", "texlive-collection-fontsrecommended"])
+            if missing_styles:
+                # Package names for individual CTAN styles vary across Fedora
+                # releases; collection-latexextra reliably includes ulem/soul.
+                packages.append("texlive-collection-latexextra")
             prefix = ["sudo"] if shutil.which("sudo") else []
             return [prefix + ["dnf", "install", "-y", *packages]], "dnf"
 
@@ -496,6 +588,11 @@ def _install_system_dependencies(missing_commands):
             print("      - Pandoc: https://pandoc.org/installing.html")
         if "xelatex" in missing_commands:
             print("      - XeLaTeX via MiKTeX, TeX Live, or MacTeX")
+        for style in missing_commands:
+            if style in LATEX_STYLE_FILES:
+                print(f"      - {style}: usually included in a full TeX Live/MacTeX install, "
+                      f"or MiKTeX will fetch it automatically the first time it's needed "
+                      f"(try 'tlmgr install ulem' otherwise)")
         return False
 
     print(f"\n[*] {manager} can install the missing system dependencies.")
@@ -530,6 +627,23 @@ def ensure_dependencies(require_pdf=False):
             missing_system.append("pandoc")
         if not _command_works("xelatex"):
             missing_system.append("xelatex")
+        elif platform.system().lower() != "windows":
+            # xelatex itself runs, but a minimal TeX install can still be missing
+            # style files (e.g. ulem.sty) that nbconvert's template needs.
+            #
+            # Skipped on Windows: the default there is MiKTeX, which fetches
+            # missing packages on the fly *during* compilation -- a hook inside
+            # the TeX engine itself, not something `kpsewhich` can see. So on a
+            # MiKTeX system, "kpsewhich can't find it yet" does NOT mean the
+            # compile will fail; it may just mean the package hasn't been
+            # auto-installed on first use yet, which would happen invisibly.
+            # Checking here would add a needless prompt for a non-problem, and
+            # in a non-interactive context (no stdin to prompt) that prompt
+            # defaults to "no" and would wrongly abort a PDF export that
+            # otherwise would have succeeded on its own.
+            for style_file in LATEX_STYLE_FILES:
+                if not _kpsewhich_finds(style_file):
+                    missing_system.append(style_file)
 
     # Auto-install Python packages via uv (or pip) without friction
     if missing_python:
@@ -558,6 +672,10 @@ def ensure_dependencies(require_pdf=False):
             still_missing_system.append("pandoc")
         if not _command_works("xelatex"):
             still_missing_system.append("xelatex")
+        elif platform.system().lower() != "windows":
+            for style_file in LATEX_STYLE_FILES:
+                if not _kpsewhich_finds(style_file):
+                    still_missing_system.append(style_file)
 
     if still_missing_python or still_missing_system:
         print("\n[!] Some dependencies are still not available:")
@@ -729,14 +847,40 @@ def preserve_markdown_html_formatting(text):
     text = re.sub(r'<\s*hr\s*/?\s*>', '\n\n---\n\n', text, flags=re.IGNORECASE)
     return text
 
+
 # Regions that must never be modified: fenced code, inline code, display math.
 _PROTECTED_MD = re.compile(r'(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`|\$\$[\s\S]*?\$\$)')
 _INLINE_MATH = re.compile(r'(?<![\\$])\$(?!\$)([^$\n]+?)(?<!\\)\$(?!\$)')
 _MATHY = re.compile(r'[\\^_{}=+\-*/<>]')
 
 
-def normalize_inline_math_spacing(text):
+def find_math_delimiter_issue(source):
+    """
+    Detect an unmatched '$$' or '$' math delimiter in a Markdown cell.
 
+    An unmatched '$$' is exactly what silently corrupts everything after it:
+    Pandoc/LaTeX keep reading in "math mode" (or drop back out of it in the
+    wrong place) until the *next* stray '$' it finds, at which point commands
+    like \\varphi end up outside math mode and XeLaTeX either mis-renders them
+    or halts with a cryptic "Missing $ inserted" error far from the real bug.
+    Returns a short description of the problem, or None if delimiters balance.
+    """
+    if '$' not in source:
+        return None
+    # Remove fenced/inline code first so '$' used literally in code can't confuse this.
+    text = re.sub(r'```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`', '', source)
+    # Strip every well-formed "$$...$$" block; anything left over is unmatched.
+    text_no_display = re.sub(r'\$\$[\s\S]*?\$\$', '', text)
+    if '$$' in text_no_display:
+        return "unmatched '$$' (display math) delimiter -- likely missing a closing '$$'"
+    # Strip every well-formed "$...$" inline block; anything left over is unmatched.
+    text_no_inline = re.sub(r'\$[^$\n]*\$', '', text_no_display)
+    if '$' in text_no_inline:
+        return "unmatched '$' (inline math) delimiter -- likely missing a closing '$'"
+    return None
+
+
+def normalize_inline_math_spacing(text):
     if not text or '$' not in text:
         return text
 
@@ -753,6 +897,7 @@ def normalize_inline_math_spacing(text):
         parts[i] = _INLINE_MATH.sub(repl, parts[i])
     return ''.join(parts)
 
+
 def scan_notebook_for_problems(nb_path):
     """Pre-flight scan for layout risks that Pandoc cannot always fix automatically."""
     try:
@@ -766,15 +911,27 @@ def scan_notebook_for_problems(nb_path):
     for i, cell in enumerate(nb.cells):
         if cell.cell_type != 'markdown':
             continue
+
         for line in cell.source.splitlines():
             if line.strip().startswith('|') and line.count('|') > 8:
                 warnings.append(f"Cell {i}: Wide Markdown table detected; it may need wrapping.")
                 break
 
+        math_issue = find_math_delimiter_issue(cell.source)
+        if math_issue:
+            warnings.append(f"Cell {i}: {math_issue}.")
+
+        if re.search(r'\\sqrt\s*\(', cell.source):
+            warnings.append(
+                f"Cell {i}: Found '\\sqrt(' -- LaTeX needs braces, e.g. \\sqrt{{5}}; "
+                f"'\\sqrt(5)' renders as a bare radical sign followed by the literal text '(5)'."
+            )
+
     if warnings:
         print(f"\n[!] PRE-FLIGHT WARNINGS for {os.path.basename(nb_path)}:")
         for w in warnings:
             print(f"    - {w}")
+        print("    These can cause XeLaTeX to fail or silently mis-render output.")
         print("-" * 40)
 
 
@@ -802,10 +959,11 @@ def extract_title_and_author(nb, filename, override_title=None):
         base = os.path.splitext(os.path.basename(filename))[0]
         base = re.sub(r'^_+tmp_+', '', base, flags=re.IGNORECASE)
         parts = base.split('_')
-        
+
         if len(parts) >= 4 and re.fullmatch(r'(HW|Exam)\d+', parts[2], re.IGNORECASE):
             author = author or f"{parts[0]} {parts[1]}"
-            hw = re.sub(r'^(HW|Exam)', lambda m: 'Homework ' if m[0].lower() == 'hw' else 'Exam ', parts[2], flags=re.IGNORECASE)
+            hw = re.sub(r'^(HW|Exam)', lambda m: 'Homework ' if m[0].lower() == 'hw' else 'Exam ', parts[2],
+                        flags=re.IGNORECASE)
             prob_num = re.sub(r'(?i)^Problem0*', '', parts[3])
             prob = f"Problem {prob_num}"
             title = title or f"{hw}: {prob}"
@@ -1084,16 +1242,41 @@ def fit_longtables(text):
             for _ in range(num_cols)
         )
         replacement = (
-            '\\begingroup\n' + size + '\n'
-            + rf'\setlength{{\tabcolsep}}{{{spacing}}}' + '\n'
-            + r'\renewcommand{\arraystretch}{1.05}' + '\n'
-            + rf'\begin{{longtable}}[]{{{spec}}}' + body + ending
-            + '\n\\endgroup'
+                '\\begingroup\n' + size + '\n'
+                + rf'\setlength{{\tabcolsep}}{{{spacing}}}' + '\n'
+                + r'\renewcommand{\arraystretch}{1.05}' + '\n'
+                + rf'\begin{{longtable}}[]{{{spec}}}' + body + ending
+                + '\n\\endgroup'
         )
         replacements.append((match.start(), end_table + len(ending), replacement))
     for start, end, replacement in reversed(replacements):
         text = text[:start] + replacement + text[end:]
     return text
+
+
+def extract_latex_errors(log_text, context_lines=4):
+    """
+    Pull the actual '!'-marked error(s) out of a XeLaTeX log.
+
+    A XeLaTeX log is mostly hundreds of lines of package-loading noise before
+    the one or two lines that matter. This finds every line starting with '!'
+    (LaTeX's own error marker) and returns it plus a few following lines of
+    context (which usually include the source line number, e.g. 'l.951 ...').
+    Falls back to the tail of the log if no '!' marker is found at all.
+    """
+    lines = log_text.splitlines()
+    blocks = []
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith('!'):
+            end = min(len(lines), i + context_lines + 1)
+            blocks.append('\n'.join(lines[i:end]))
+            i = end
+        else:
+            i += 1
+    if blocks:
+        return '\n\n'.join(blocks)
+    return log_text[-2000:]
 
 
 def compile_pdf(temp_tex, target_dir, max_passes=3):
@@ -1125,7 +1308,7 @@ def process_single_file(ipynb_path, override_title=None, debug=False):
 
     base_name = os.path.splitext(ipynb_path)[0]
     target_dir = os.path.dirname(ipynb_path)
-    
+
     scan_notebook_for_problems(ipynb_path)
     print(f"[*] Processing: {os.path.basename(ipynb_path)}")
 
@@ -1154,10 +1337,10 @@ def process_single_file(ipynb_path, override_title=None, debug=False):
                 "--TemplateExporter.exclude_input_prompt=" + str(REMOVE_EXECUTION_PROMPTS),
                 "--TemplateExporter.exclude_output_prompt=" + str(REMOVE_EXECUTION_PROMPTS),
                 temp_ipynb
-            ], 
+            ],
             capture_output=True, text=True
         )
-        
+
         if convert_res.returncode != 0:
             print(f"    [FAILED] nbconvert failed: {convert_res.stderr[:300]}")
             return
@@ -1175,9 +1358,9 @@ def process_single_file(ipynb_path, override_title=None, debug=False):
         pdf_res = compile_pdf(temp_tex, target_dir)
 
         pdf_ok = (
-            pdf_res.returncode == 0
-            and os.path.exists(temp_pdf)
-            and os.path.getsize(temp_pdf) > 0
+                pdf_res.returncode == 0
+                and os.path.exists(temp_pdf)
+                and os.path.getsize(temp_pdf) > 0
         )
 
         if pdf_ok:
@@ -1187,9 +1370,10 @@ def process_single_file(ipynb_path, override_title=None, debug=False):
             print(f"    [SUCCESS] -> {os.path.basename(final_pdf)} (Title: '{doc_title}')")
         else:
             print("    [FAILED] xelatex failed to produce a valid PDF.")
+            details = (pdf_res.stdout or "") + "\n" + (pdf_res.stderr or "")
+            print(f"    --- LaTeX Error ---\n{extract_latex_errors(details)}")
             if debug:
-                details = (pdf_res.stdout or "") + "\n" + (pdf_res.stderr or "")
-                print(f"    --- LaTeX Error Log ---\n{details[-2000:]}")
+                print(f"\n    --- Full LaTeX Log (tail) ---\n{details[-2000:]}")
 
     except Exception as e:
         print(f"    [ERROR] {e}")
@@ -1206,7 +1390,7 @@ def create_notebooks(hw_num, num_problems, exam=False):
     base_dir = get_base_path(exam=exam)
     target_path = os.path.join(base_dir, f"{prefix}{hw_num}")
     os.makedirs(target_path, exist_ok=True)
-    
+
     overwrite_all = False
     skip_all = False
 
@@ -1227,15 +1411,19 @@ def create_notebooks(hw_num, num_problems, exam=False):
 
         if os.path.exists(filepath) and not overwrite_all and not skip_all:
             choice = input(f"[?] {filename} already exists. Overwrite? (y/n/all/skip): ").lower()
-            if choice == 'all': overwrite_all = True
-            elif choice == 'skip': skip_all = True; continue
-            elif choice != 'y': continue
+            if choice == 'all':
+                overwrite_all = True
+            elif choice == 'skip':
+                skip_all = True; continue
+            elif choice != 'y':
+                continue
 
         if skip_all: continue
 
         nb = nbf.v4.new_notebook()
         cells = [
-            nbf.v4.new_markdown_cell(f"# {label} {hw_num}: Problem {i} - *Problem Title*\n**{FIRST_NAME} {LAST_NAME}**"),
+            nbf.v4.new_markdown_cell(
+                f"# {label} {hw_num}: Problem {i} - *Problem Title*\n**{FIRST_NAME} {LAST_NAME}**"),
             nbf.v4.new_markdown_cell("(statement)"),
             nbf.v4.new_markdown_cell("## Solution"),
             nbf.v4.new_code_cell(starter_code),
@@ -1285,14 +1473,16 @@ def main():
     pdf = subparsers.add_parser('pdf', parents=[base_parser], help="Export notebooks to PDF")
     pdf_target = pdf.add_mutually_exclusive_group(required=True)
     pdf_target.add_argument('-hw', '--hw_num', type=positive_int, help='Export a homework folder')
-    pdf_target.add_argument('-exam', '--exam', '--exam_num', dest='exam_num', type=positive_int, help='Export an exam folder')
+    pdf_target.add_argument('-exam', '--exam', '--exam_num', dest='exam_num', type=positive_int,
+                            help='Export an exam folder')
     pdf_target.add_argument('-m', '--manual', type=str, help='Export one notebook by path')
     pdf.add_argument('-t', '--title', type=str, help='Manually override document title')
     pdf.add_argument('-d', '--debug', action='store_true', help='Preserve intermediate LaTeX files')
 
     # Command: config
     cfg_cmd = subparsers.add_parser('config', parents=[base_parser], help="View or modify user configuration")
-    cfg_cmd.add_argument('--set', nargs='+', help="Set config values (e.g. --set first_name=Alice subfolder='Homework')")
+    cfg_cmd.add_argument('--set', nargs='+',
+                         help="Set config values (e.g. --set first_name=Alice subfolder='Homework')")
 
     # Command: update
     subparsers.add_parser('update', parents=[base_parser], help="Force check and pull updates from GitHub")
