@@ -71,7 +71,6 @@ DEFAULT_CONFIG = {
 
 def load_config():
     """Load configuration from genhw_config.json (or settings.json), prompting setup if missing."""
-    # Seamless migration from legacy config filenames if present
     if not os.path.exists(CONFIG_FILE):
         for legacy in LEGACY_CONFIG_FILES:
             if os.path.exists(legacy):
@@ -939,10 +938,10 @@ def extract_title_and_author(nb, filename, override_title=None):
         base = re.sub(r'^_+tmp_+', '', base, flags=re.IGNORECASE)
         parts = base.split('_')
 
-        # Matches HW1, Exam1, Discussion1, Disc1
-        if len(parts) >= 3 and re.fullmatch(r'(HW|Exam|Discussion|Disc)\d+', parts[2], re.IGNORECASE):
+        # Matches HW1, Exam1, Discussion1, Disc1, D1
+        if len(parts) >= 3 and re.fullmatch(r'(HW|Exam|Discussion|Disc|D)\d+', parts[2], re.IGNORECASE):
             author = author or f"{parts[0]} {parts[1]}"
-            match = re.match(r'^(HW|Exam|Discussion|Disc)(\d+)', parts[2], re.IGNORECASE)
+            match = re.match(r'^(HW|Exam|Discussion|Disc|D)(\d+)', parts[2], re.IGNORECASE)
             kind = match.group(1).lower()
             num = match.group(2)
             if kind == 'hw':
@@ -1361,7 +1360,7 @@ def create_notebooks(hw_num, num_problems, category="hw", exam=False, separate=F
     elif category in ("disc", "discussion"):
         category = "disc"
         label = "Discussion"
-        prefix = "Discussion"
+        prefix = "D"
     else:
         category = "hw"
         label = "Homework"
@@ -1377,7 +1376,8 @@ def create_notebooks(hw_num, num_problems, category="hw", exam=False, separate=F
         "## Discussion\n\nAI Declaration: (declaration)\n\n(discussion)"
     )
 
-    # Discussions combine all problems into a single file by default unless -s / --separate is passed
+    # Discussions: Single combined file by default (unless -s / --separate is passed)
+    # Contains ONLY '# Discussion <N>\n**<Name>**' followed directly by code block(s)
     if category == "disc" and not separate:
         filename = f"{FIRST_NAME}_{LAST_NAME}_{prefix}{hw_num}.ipynb"
         filepath = os.path.join(target_path, filename)
@@ -1392,20 +1392,16 @@ def create_notebooks(hw_num, num_problems, category="hw", exam=False, separate=F
             nbf.v4.new_markdown_cell(f"# {label} {hw_num}\n**{FIRST_NAME} {LAST_NAME}**")
         ]
         for i in range(1, num_problems + 1):
-            cells.extend([
-                nbf.v4.new_markdown_cell(f"# {label} {hw_num}: Problem {i} - *Problem Title*"),
-                nbf.v4.new_markdown_cell("(statement)"),
-                nbf.v4.new_markdown_cell("## Solution"),
-                nbf.v4.new_code_cell(starter_code),
-                nbf.v4.new_markdown_cell(ai_declaration),
-            ])
+            code_text = f"# Problem {i}\n" + starter_code if num_problems > 1 else starter_code
+            cells.append(nbf.v4.new_code_cell(code_text))
+
         nb['cells'] = cells
         with open(filepath, 'w', encoding='utf-8') as f:
             nbf.write(nb, f)
         print(f"  + Generated: {filename} (Contains all {num_problems} problems)")
         return
 
-    # Standard flow: separate file per problem
+    # Separate files per problem
     overwrite_all = False
     skip_all = False
 
@@ -1427,14 +1423,23 @@ def create_notebooks(hw_num, num_problems, category="hw", exam=False, separate=F
             continue
 
         nb = nbf.v4.new_notebook()
-        cells = [
-            nbf.v4.new_markdown_cell(
-                f"# {label} {hw_num}: Problem {i} - *Problem Title*\n**{FIRST_NAME} {LAST_NAME}**"),
-            nbf.v4.new_markdown_cell("(statement)"),
-            nbf.v4.new_markdown_cell("## Solution"),
-            nbf.v4.new_code_cell(starter_code),
-            nbf.v4.new_markdown_cell(ai_declaration)
-        ]
+        if category == "disc":
+            # Discussion separate files: Title and code only
+            cells = [
+                nbf.v4.new_markdown_cell(f"# {label} {hw_num}\n**{FIRST_NAME} {LAST_NAME}**"),
+                nbf.v4.new_code_cell(starter_code)
+            ]
+        else:
+            # Homework and Exams: Standard layout
+            cells = [
+                nbf.v4.new_markdown_cell(
+                    f"# {label} {hw_num}: Problem {i} - *Problem Title*\n**{FIRST_NAME} {LAST_NAME}**"),
+                nbf.v4.new_markdown_cell("(statement)"),
+                nbf.v4.new_markdown_cell("## Solution"),
+                nbf.v4.new_code_cell(starter_code),
+                nbf.v4.new_markdown_cell(ai_declaration)
+            ]
+
         nb['cells'] = cells
         with open(filepath, 'w', encoding='utf-8') as f:
             nbf.write(nb, f)
@@ -1567,7 +1572,7 @@ def main():
         elif args.hw_num is not None or args.exam_num is not None or args.disc_num is not None:
             if args.disc_num is not None:
                 category = "disc"
-                prefix = "Discussion"
+                prefix = "D"
                 number = args.disc_num
             elif args.exam_num is not None:
                 category = "exam"
@@ -1580,6 +1585,12 @@ def main():
 
             base_dir = get_base_path(category=category)
             target_dir = os.path.join(base_dir, f"{prefix}{number}")
+            # Fallback for existing legacy Discussion folders
+            if not os.path.exists(target_dir) and category == "disc":
+                legacy_dir = os.path.join(base_dir, f"Discussion{number}")
+                if os.path.exists(legacy_dir):
+                    target_dir = legacy_dir
+
             if not os.path.exists(target_dir):
                 print(f"[!] Folder {target_dir} not found.")
                 return
