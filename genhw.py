@@ -134,6 +134,34 @@ def prompt_initial_config():
     return cfg
 
 
+def sync_config_file_options():
+    """Update genhw_config.json on disk with any new keys added to DEFAULT_CONFIG."""
+    user_raw = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                user_raw = json.load(f)
+        except Exception as e:
+            print(f"[!] Could not read existing configuration: {e}")
+            return
+
+    missing_keys = [k for k in DEFAULT_CONFIG if k not in user_raw]
+
+    if missing_keys:
+        print(f"\n[*] Updating {os.path.basename(CONFIG_FILE)} with new configuration options:")
+        for k in missing_keys:
+            user_raw[k] = DEFAULT_CONFIG[k]
+            if k == "starter_code":
+                print("    + starter_code: (default code block with imports)")
+            else:
+                print(f"    + {k}: {json.dumps(DEFAULT_CONFIG[k])}")
+        save_config(user_raw)
+        reload_globals_from_config(user_raw)
+        print("[SUCCESS] Configuration file successfully updated with all current options!\n")
+    else:
+        print(f"\n[*] {os.path.basename(CONFIG_FILE)} already contains all available options.\n")
+
+
 # Initialize active configuration and variables
 CONFIG = load_config()
 FIRST_NAME = CONFIG.get("first_name", "First")
@@ -1461,9 +1489,11 @@ def main():
     pdf.add_argument('-dbg', '--debug', action='store_true', help='Preserve intermediate LaTeX files')
 
     # Command: config
-    cfg_cmd = subparsers.add_parser('config', parents=[base_parser], help="View or modify user configuration")
+    cfg_cmd = subparsers.add_parser('config', parents=[base_parser], help="View, modify, or update user configuration")
     cfg_cmd.add_argument('--set', nargs='+',
                          help="Set config values (e.g. --set first_name=Alice subfolder='Homework Problems')")
+    cfg_cmd.add_argument('--update', '--upgrade', '--sync', dest='sync', action='store_true',
+                         help="Update genhw_config.json on disk with any missing/new options")
 
     # Command: update
     subparsers.add_parser('update', parents=[base_parser], help="Force check and pull updates from GitHub")
@@ -1496,7 +1526,9 @@ def main():
 
     # Config command handler
     if args.command == 'config':
-        if args.set:
+        if args.sync:
+            sync_config_file_options()
+        elif args.set:
             for item in args.set:
                 if '=' in item:
                     k, v = item.split('=', 1)
@@ -1512,7 +1544,8 @@ def main():
         else:
             print(f"\nCurrent Configuration ({CONFIG_FILE}):")
             print(json.dumps(cfg, indent=4))
-            print(f"\nModify via: python genhw.py config --set first_name=YourName\n")
+            print(f"\nModify via: python genhw.py config --set first_name=YourName")
+            print(f"Sync new options to disk: python genhw.py config --update\n")
         return
 
     # Check dependencies only for commands that need them
