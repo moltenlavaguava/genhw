@@ -1,5 +1,3 @@
-### Imports
-
 import os
 import argparse
 import subprocess
@@ -22,10 +20,13 @@ nbf = None
 # being the homework number and second number being number of problems.
 
 # Command to Generate the files         python genhw.py gen -hw 1 -n 2
-
 # Command to Generate the pdfs          python genhw.py pdf -hw 2
+
 # Command to Generate exam files        python genhw.py gen -exam 1 -n 2
 # Command to Generate exam PDFs         python genhw.py pdf -exam 1
+
+# Command to Generate discussion files  python genhw.py gen -d 1 -n 2
+# Command to Generate discussion PDFs   python genhw.py pdf -d 1
 
 
 # ==============================================================================
@@ -37,30 +38,49 @@ REPO_API_COMMITS = "https://api.github.com/repos/moltenlavaguava/genhw/commits/m
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "genhw_config.json")
-LEGACY_CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+LEGACY_CONFIG_FILES = [
+    os.path.join(SCRIPT_DIR, "settings.json"),
+    os.path.join(SCRIPT_DIR, "config.json"),
+]
+
+DEFAULT_STARTER_CODE = (
+    "# Setup & settings\n"
+    "import math\n"
+    "import numpy as np\n"
+    "from scipy.optimize import fsolve\n"
+    "import matplotlib.pyplot as plt\n"
+    "import pandas as pd\n\n"
+    "# Display tables in VS Code; genhw.py converts HTML tables for PDF.\n"
+    "pd.set_option('styler.render.repr', 'html')\n"
+)
 
 DEFAULT_CONFIG = {
     "first_name": "First",
     "last_name": "Last",
     "subfolder": "Homework Problems",
     "exam_subfolder": "Exam Problems",
+    "discussion_subfolder": "Discussion Problems",
     "pdf_margin": "0.5in",
     "remove_notebook_title_cell": True,
     "remove_execution_prompts": True,
     "unnumber_markdown_headings": True,
+    "starter_code": DEFAULT_STARTER_CODE,
     "check_updates": False,
 }
 
 
 def load_config():
-    """Load configuration from genhw_config.json, prompting setup if missing."""
-    # Seamless migration from old config.json if present
-    if not os.path.exists(CONFIG_FILE) and os.path.exists(LEGACY_CONFIG_FILE):
-        try:
-            shutil.move(LEGACY_CONFIG_FILE, CONFIG_FILE)
-            print(f"[*] Migrated legacy config.json -> {CONFIG_FILE}")
-        except Exception:
-            pass
+    """Load configuration from genhw_config.json (or settings.json), prompting setup if missing."""
+    # Seamless migration from legacy config filenames if present
+    if not os.path.exists(CONFIG_FILE):
+        for legacy in LEGACY_CONFIG_FILES:
+            if os.path.exists(legacy):
+                try:
+                    shutil.copyfile(legacy, CONFIG_FILE)
+                    print(f"[*] Loaded existing configuration from {os.path.basename(legacy)} -> {CONFIG_FILE}")
+                    break
+                except Exception:
+                    pass
 
     if not os.path.exists(CONFIG_FILE):
         return prompt_initial_config()
@@ -94,9 +114,12 @@ def prompt_initial_config():
         last = input("Enter your Last Name [Last]: ").strip() or "Last"
         subfolder = input("Homework subfolder [Homework Problems]: ").strip() or "Homework Problems"
         exam_sub = input("Exam subfolder [Exam Problems]: ").strip() or "Exam Problems"
+        disc_sub = input("Discussion subfolder [Discussion Problems]: ").strip() or "Discussion Problems"
     except (EOFError, KeyboardInterrupt):
         print()
-        first, last, subfolder, exam_sub = "First", "Last", "Homework Problems", "Exam Problems"
+        first, last, subfolder, exam_sub, disc_sub = (
+            "First", "Last", "Homework Problems", "Exam Problems", "Discussion Problems"
+        )
 
     cfg = {
         **DEFAULT_CONFIG,
@@ -104,6 +127,7 @@ def prompt_initial_config():
         "last_name": last,
         "subfolder": subfolder,
         "exam_subfolder": exam_sub,
+        "discussion_subfolder": disc_sub,
     }
     save_config(cfg)
     print("=" * 55 + "\n")
@@ -116,24 +140,28 @@ FIRST_NAME = CONFIG.get("first_name", "First")
 LAST_NAME = CONFIG.get("last_name", "Last")
 SUBFOLDER = CONFIG.get("subfolder", "Homework Problems")
 EXAM_SUBFOLDER = CONFIG.get("exam_subfolder", "Exam Problems")
+DISCUSSION_SUBFOLDER = CONFIG.get("discussion_subfolder", "Discussion Problems")
 PDF_MARGIN = CONFIG.get("pdf_margin", "0.5in")
 REMOVE_NOTEBOOK_TITLE_CELL = CONFIG.get("remove_notebook_title_cell", True)
 REMOVE_EXECUTION_PROMPTS = CONFIG.get("remove_execution_prompts", True)
 UNNUMBER_MARKDOWN_HEADINGS = CONFIG.get("unnumber_markdown_headings", True)
+STARTER_CODE = CONFIG.get("starter_code", DEFAULT_STARTER_CODE)
 
 
 def reload_globals_from_config(cfg):
     """Update global variables after config changes."""
-    global FIRST_NAME, LAST_NAME, SUBFOLDER, EXAM_SUBFOLDER, PDF_MARGIN
-    global REMOVE_NOTEBOOK_TITLE_CELL, REMOVE_EXECUTION_PROMPTS, UNNUMBER_MARKDOWN_HEADINGS
+    global FIRST_NAME, LAST_NAME, SUBFOLDER, EXAM_SUBFOLDER, DISCUSSION_SUBFOLDER, PDF_MARGIN
+    global REMOVE_NOTEBOOK_TITLE_CELL, REMOVE_EXECUTION_PROMPTS, UNNUMBER_MARKDOWN_HEADINGS, STARTER_CODE
     FIRST_NAME = cfg.get("first_name", "First")
     LAST_NAME = cfg.get("last_name", "Last")
     SUBFOLDER = cfg.get("subfolder", "Homework Problems")
     EXAM_SUBFOLDER = cfg.get("exam_subfolder", "Exam Problems")
+    DISCUSSION_SUBFOLDER = cfg.get("discussion_subfolder", "Discussion Problems")
     PDF_MARGIN = cfg.get("pdf_margin", "0.5in")
     REMOVE_NOTEBOOK_TITLE_CELL = cfg.get("remove_notebook_title_cell", True)
     REMOVE_EXECUTION_PROMPTS = cfg.get("remove_execution_prompts", True)
     UNNUMBER_MARKDOWN_HEADINGS = cfg.get("unnumber_markdown_headings", True)
+    STARTER_CODE = cfg.get("starter_code", DEFAULT_STARTER_CODE)
 
 
 # ==============================================================================
@@ -341,36 +369,16 @@ PYTHON_DEPENDENCIES = {
     "scipy": "scipy",
 }
 
-# LaTeX style files nbconvert's default template can pull in (e.g. `soul`/`ulem`
-# for pandoc's strikethrough support) that a *minimal* TeX install may be
-# missing even though xelatex itself runs fine. Maps style file -> apt package.
-# On apt systems this is auto-installed like pandoc/xelatex; on other platforms
-# a full TeX Live/MacTeX/MiKTeX install (or MiKTeX's on-the-fly package
-# fetching) already covers this, so we just check apt-based Linux here.
 LATEX_STYLE_FILES = {
     "ulem.sty": "texlive-plain-generic",
 }
 
-# The CTAN/package name for the same style file, as understood by TeX's own
-# package managers (tlmgr for TeX Live, MiKTeX's console/mpm for MiKTeX).
-# These work identically on Windows/macOS/Linux and only touch the one
-# missing package, so they're tried before falling back to an OS package
-# manager that would otherwise have nothing to do (see _system_install_command).
 TEX_PACKAGE_MANAGER_NAMES = {
     "ulem.sty": "ulem",
 }
 
 
 def _tex_native_install_command(missing_styles):
-    """
-    Prefer TeX's own package manager (tlmgr / MiKTeX) for missing style files.
-
-    This matters because the OS-level branches below only know how to install
-    pandoc/xelatex themselves; when those already work and only a style file
-    is missing, asking winget/brew to do anything would be a no-op. tlmgr and
-    MiKTeX's CLI are the actual right tool for "fetch one missing package" and
-    exist the same way across Windows, macOS and Linux TeX Live installs.
-    """
     if not missing_styles:
         return None, None
     packages = [TEX_PACKAGE_MANAGER_NAMES[s] for s in missing_styles if s in TEX_PACKAGE_MANAGER_NAMES]
@@ -387,11 +395,8 @@ def _tex_native_install_command(missing_styles):
 
 
 def _kpsewhich_finds(style_file):
-    """Return True if the LaTeX package manager can locate a style file."""
     kpsewhich = shutil.which("kpsewhich")
     if not kpsewhich:
-        # No kpsewhich available to check with; don't block on it here, the
-        # xelatex command-existence check already covers a missing TeX install.
         return True
     try:
         result = subprocess.run(
@@ -404,7 +409,6 @@ def _kpsewhich_finds(style_file):
 
 
 def _command_works(command, version_args=("--version",)):
-    """Return True only when a command exists and can actually run."""
     executable = shutil.which(command)
     if not executable:
         return False
@@ -421,7 +425,6 @@ def _command_works(command, version_args=("--version",)):
 
 
 def _python_module_works(module_name):
-    """Check that a Python dependency is importable, not merely installed."""
     try:
         if importlib.util.find_spec(module_name) is None:
             return False
@@ -432,7 +435,6 @@ def _python_module_works(module_name):
 
 
 def _ask_yes_no(prompt, default=True):
-    """Small interactive yes/no helper; Enter accepts the default."""
     suffix = " [Y/n]: " if default else " [y/N]: "
     while True:
         try:
@@ -450,7 +452,6 @@ def _ask_yes_no(prompt, default=True):
 
 
 def _get_uv_command():
-    """Return command prefix to run 'uv pip install' targeting active Python if available."""
     if _command_works("uv"):
         return ["uv", "pip", "install", "--python", sys.executable]
     if _python_module_works("uv"):
@@ -459,11 +460,9 @@ def _get_uv_command():
 
 
 def _install_python_dependencies(packages):
-    """Auto-install Python packages via uv if available, falling back to pip."""
     if not packages:
         return True
 
-    # 1. Try uv first for speed
     uv_cmd = _get_uv_command()
     if uv_cmd:
         print(f"\n[*] Auto-installing Python dependencies using uv: {', '.join(packages)}")
@@ -475,7 +474,6 @@ def _install_python_dependencies(packages):
         except Exception as e:
             print(f"[!] Could not run uv ({e}); falling back to standard pip...")
 
-    # 2. Fallback to pip
     print(f"\n[*] Installing Python dependencies using pip: {', '.join(packages)}")
     cmd = [sys.executable, "-m", "pip", "install", *packages]
     try:
@@ -487,13 +485,7 @@ def _install_python_dependencies(packages):
 
 
 def _system_install_command(missing_commands):
-    """Return a platform/package-manager install command for Pandoc/XeLaTeX/style files."""
     commands, manager = _system_install_command_impl(missing_commands)
-    # Guard against a branch returning a real manager name paired with an
-    # empty command list (e.g. only a style file is missing and that OS
-    # branch only knows how to install pandoc/xelatex) -- callers treat
-    # `not commands` as "no installer available", so normalize that here
-    # instead of at every call site.
     if not commands:
         return None, None
     return commands, manager
@@ -503,13 +495,8 @@ def _system_install_command_impl(missing_commands):
     system = platform.system().lower()
     need_pandoc = "pandoc" in missing_commands
     need_xelatex = "xelatex" in missing_commands
-    # Anything in missing_commands that isn't "pandoc"/"xelatex" is a missing
-    # LaTeX style file (e.g. "ulem.sty"), keyed against LATEX_STYLE_FILES.
     missing_styles = [m for m in missing_commands if m not in ("pandoc", "xelatex")]
 
-    # If pandoc/xelatex already work and only a style file is missing, use
-    # TeX's own package manager rather than an OS package manager that has
-    # no actual work to do for that case (see _tex_native_install_command).
     if missing_styles and not need_pandoc and not need_xelatex:
         commands, manager = _tex_native_install_command(missing_styles)
         if commands:
@@ -569,8 +556,6 @@ def _system_install_command_impl(missing_commands):
             if need_xelatex:
                 packages.extend(["texlive-xetex", "texlive-collection-fontsrecommended"])
             if missing_styles:
-                # Package names for individual CTAN styles vary across Fedora
-                # releases; collection-latexextra reliably includes ulem/soul.
                 packages.append("texlive-collection-latexextra")
             prefix = ["sudo"] if shutil.which("sudo") else []
             return [prefix + ["dnf", "install", "-y", *packages]], "dnf"
@@ -579,7 +564,6 @@ def _system_install_command_impl(missing_commands):
 
 
 def _install_system_dependencies(missing_commands):
-    """Interactively install Pandoc/XeLaTeX using an available package manager."""
     commands, manager = _system_install_command(missing_commands)
     if not commands:
         print("\n[!] I could not find a supported system package manager automatically.")
@@ -590,9 +574,7 @@ def _install_system_dependencies(missing_commands):
             print("      - XeLaTeX via MiKTeX, TeX Live, or MacTeX")
         for style in missing_commands:
             if style in LATEX_STYLE_FILES:
-                print(f"      - {style}: usually included in a full TeX Live/MacTeX install, "
-                      f"or MiKTeX will fetch it automatically the first time it's needed "
-                      f"(try 'tlmgr install ulem' otherwise)")
+                print(f"      - {style}: try 'tlmgr install ulem'")
         return False
 
     print(f"\n[*] {manager} can install the missing system dependencies.")
@@ -613,7 +595,6 @@ def _install_system_dependencies(missing_commands):
 
 
 def ensure_dependencies(require_pdf=False):
-    """Check dependencies and auto-install Python packages via uv/pip; prompt for system tools."""
     global nbf
 
     missing_python = [
@@ -628,31 +609,16 @@ def ensure_dependencies(require_pdf=False):
         if not _command_works("xelatex"):
             missing_system.append("xelatex")
         elif platform.system().lower() != "windows":
-            # xelatex itself runs, but a minimal TeX install can still be missing
-            # style files (e.g. ulem.sty) that nbconvert's template needs.
-            #
-            # Skipped on Windows: the default there is MiKTeX, which fetches
-            # missing packages on the fly *during* compilation -- a hook inside
-            # the TeX engine itself, not something `kpsewhich` can see. So on a
-            # MiKTeX system, "kpsewhich can't find it yet" does NOT mean the
-            # compile will fail; it may just mean the package hasn't been
-            # auto-installed on first use yet, which would happen invisibly.
-            # Checking here would add a needless prompt for a non-problem, and
-            # in a non-interactive context (no stdin to prompt) that prompt
-            # defaults to "no" and would wrongly abort a PDF export that
-            # otherwise would have succeeded on its own.
             for style_file in LATEX_STYLE_FILES:
                 if not _kpsewhich_finds(style_file):
                     missing_system.append(style_file)
 
-    # Auto-install Python packages via uv (or pip) without friction
     if missing_python:
         if not _install_python_dependencies(missing_python):
             print("[!] One or more Python dependencies could not be installed.")
             return False
         importlib.invalidate_caches()
 
-    # Heavy system tools (Pandoc / LaTeX) require system-level privileges; prompt first
     if missing_system:
         print("\n[!] Missing system tools for PDF export: " + ", ".join(missing_system))
         if not _ask_yes_no("Would you like to install/repair them now?", default=True):
@@ -693,7 +659,6 @@ def ensure_dependencies(require_pdf=False):
 
 
 def cleanup_temp_artifacts(temp_base):
-    """Remove every temporary file/folder created for one notebook conversion."""
     for path in glob.glob(temp_base + "*"):
         try:
             if os.path.isdir(path) and not os.path.islink(path):
@@ -706,9 +671,16 @@ def cleanup_temp_artifacts(temp_base):
             print(f"    [!] Could not remove temporary artifact '{path}': {e}")
 
 
-def get_base_path(exam=False):
+def get_base_path(category="hw", exam=False):
+    """Resolve base directory for homework, exams, or discussions."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    subfolder = EXAM_SUBFOLDER if exam else SUBFOLDER
+    if exam or category == "exam":
+        subfolder = EXAM_SUBFOLDER
+    elif category in ("disc", "discussion"):
+        subfolder = DISCUSSION_SUBFOLDER
+    else:
+        subfolder = SUBFOLDER
+
     if subfolder.strip():
         path = os.path.join(script_dir, subfolder.strip())
         os.makedirs(path, exist_ok=True)
@@ -717,7 +689,6 @@ def get_base_path(exam=False):
 
 
 def get_pandoc_path():
-    """Finds the Pandoc executable used by nbconvert."""
     try:
         from nbconvert.utils.pandoc import find_pandoc
         return find_pandoc()
@@ -727,7 +698,6 @@ def get_pandoc_path():
 
 
 def sanitize_latex(text):
-    """Escape LaTeX special characters in plain text using a single pass."""
     if not text:
         return ""
     replacements = {
@@ -746,7 +716,6 @@ def sanitize_latex(text):
 
 
 def sanitize_latex_preserving_math(text):
-    """Escape title text while preserving inline LaTeX math such as $\\pi$."""
     if not text:
         return ""
     parts = re.split(r'(\$[^$]*\$|\\\([^)]*\\\))', text)
@@ -760,7 +729,6 @@ def sanitize_latex_preserving_math(text):
 
 
 def _html_inline_to_markdown(text):
-    """Translate a conservative set of inline HTML tags to Markdown/raw TeX."""
     if not text:
         return text
     text = re.sub(r'<\s*(?:b|strong)\s*>', '**', text, flags=re.IGNORECASE)
@@ -775,7 +743,6 @@ def _html_inline_to_markdown(text):
 
 
 def _markdown_fragment_to_latex(text):
-    """Convert a Markdown fragment to LaTeX for use inside an alignment block."""
     pandoc_bin = get_pandoc_path()
     if not pandoc_bin:
         return text
@@ -796,7 +763,6 @@ def _markdown_fragment_to_latex(text):
 
 
 def preserve_markdown_html_formatting(text):
-    """Preserve common HTML presentation tags when exporting Markdown to PDF."""
     if not text or '<' not in text:
         return text
 
@@ -848,32 +814,18 @@ def preserve_markdown_html_formatting(text):
     return text
 
 
-# Regions that must never be modified: fenced code, inline code, display math.
 _PROTECTED_MD = re.compile(r'(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`|\$\$[\s\S]*?\$\$)')
 _INLINE_MATH = re.compile(r'(?<![\\$])\$(?!\$)([^$\n]+?)(?<!\\)\$(?!\$)')
 _MATHY = re.compile(r'[\\^_{}=+\-*/<>]')
 
 
 def find_math_delimiter_issue(source):
-    """
-    Detect an unmatched '$$' or '$' math delimiter in a Markdown cell.
-
-    An unmatched '$$' is exactly what silently corrupts everything after it:
-    Pandoc/LaTeX keep reading in "math mode" (or drop back out of it in the
-    wrong place) until the *next* stray '$' it finds, at which point commands
-    like \\varphi end up outside math mode and XeLaTeX either mis-renders them
-    or halts with a cryptic "Missing $ inserted" error far from the real bug.
-    Returns a short description of the problem, or None if delimiters balance.
-    """
     if '$' not in source:
         return None
-    # Remove fenced/inline code first so '$' used literally in code can't confuse this.
     text = re.sub(r'```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`', '', source)
-    # Strip every well-formed "$$...$$" block; anything left over is unmatched.
     text_no_display = re.sub(r'\$\$[\s\S]*?\$\$', '', text)
     if '$$' in text_no_display:
         return "unmatched '$$' (display math) delimiter -- likely missing a closing '$$'"
-    # Strip every well-formed "$...$" inline block; anything left over is unmatched.
     text_no_inline = re.sub(r'\$[^$\n]*\$', '', text_no_display)
     if '$' in text_no_inline:
         return "unmatched '$' (inline math) delimiter -- likely missing a closing '$'"
@@ -892,7 +844,6 @@ def normalize_inline_math_spacing(text):
         return m.group(0)
 
     parts = _PROTECTED_MD.split(text)
-    # Even indices are ordinary text; odd indices are protected regions.
     for i in range(0, len(parts), 2):
         parts[i] = _INLINE_MATH.sub(repl, parts[i])
     return ''.join(parts)
@@ -936,7 +887,7 @@ def scan_notebook_for_problems(nb_path):
 
 
 def extract_title_and_author(nb, filename, override_title=None):
-    """Safely extracts Title and Author with a multi-level fallback cascade."""
+    """Safely extracts Title and Author with support for HW, Exams, and Discussions."""
     if override_title:
         return override_title, f"{FIRST_NAME} {LAST_NAME}"
 
@@ -960,13 +911,24 @@ def extract_title_and_author(nb, filename, override_title=None):
         base = re.sub(r'^_+tmp_+', '', base, flags=re.IGNORECASE)
         parts = base.split('_')
 
-        if len(parts) >= 4 and re.fullmatch(r'(HW|Exam)\d+', parts[2], re.IGNORECASE):
+        # Matches HW1, Exam1, Discussion1, Disc1
+        if len(parts) >= 3 and re.fullmatch(r'(HW|Exam|Discussion|Disc)\d+', parts[2], re.IGNORECASE):
             author = author or f"{parts[0]} {parts[1]}"
-            hw = re.sub(r'^(HW|Exam)', lambda m: 'Homework ' if m[0].lower() == 'hw' else 'Exam ', parts[2],
-                        flags=re.IGNORECASE)
-            prob_num = re.sub(r'(?i)^Problem0*', '', parts[3])
-            prob = f"Problem {prob_num}"
-            title = title or f"{hw}: {prob}"
+            match = re.match(r'^(HW|Exam|Discussion|Disc)(\d+)', parts[2], re.IGNORECASE)
+            kind = match.group(1).lower()
+            num = match.group(2)
+            if kind == 'hw':
+                label = 'Homework'
+            elif kind == 'exam':
+                label = 'Exam'
+            else:
+                label = 'Discussion'
+
+            if len(parts) >= 4 and 'problem' in parts[3].lower():
+                prob_num = re.sub(r'(?i)^Problem0*', '', parts[3])
+                title = title or f"{label} {num}: Problem {prob_num}"
+            else:
+                title = title or f"{label} {num}"
         else:
             clean_base = base.replace('_', ' ').replace('-', ' ').strip().title()
             title = title or (clean_base if clean_base else "Homework Submission")
@@ -979,7 +941,6 @@ def extract_title_and_author(nb, filename, override_title=None):
 
 
 def prepare_notebook_for_pdf(nb):
-    """Clean a temporary notebook copy for PDF export without altering the original."""
     if REMOVE_NOTEBOOK_TITLE_CELL and nb.cells:
         first = nb.cells[0]
         if first.cell_type == 'markdown':
@@ -1015,7 +976,6 @@ def prepare_notebook_for_pdf(nb):
 
 
 def convert_html_tables_to_latex(nb):
-    """Converts HTML tables (like Pandas df.style) to LaTeX via Pandoc."""
     pandoc_bin = get_pandoc_path()
     if not pandoc_bin:
         return
@@ -1044,7 +1004,6 @@ def convert_html_tables_to_latex(nb):
                     )
                     if res.returncode == 0 and res.stdout.strip():
                         latex = res.stdout
-
                         caption_match = re.search(
                             r'<caption[^>]*>([\s\S]*?)</caption>',
                             html_str,
@@ -1088,8 +1047,6 @@ def convert_html_tables_to_latex(nb):
 
 
 def patch_latex(tex_content, title, author):
-    """Clean document metadata, headings, margins, code layout, and wide tables."""
-    # 1. Fix Python/nbconvert counter issue.
     if r"\newcounter{none}" not in tex_content:
         tex_content = tex_content.replace(
             r"\begin{document}",
@@ -1097,7 +1054,6 @@ def patch_latex(tex_content, title, author):
             1,
         )
 
-    # 2. Make the page geometry deterministic.
     if r"\usepackage{array}" not in tex_content:
         tex_content = tex_content.replace(
             r"\usepackage{geometry}",
@@ -1112,7 +1068,6 @@ def patch_latex(tex_content, title, author):
     )
     tex_content = tex_content.replace(r"\begin{document}", r"\begin{document}" + "\n" + r"\raggedbottom", 1)
 
-    # 3. Clean and format document title/author. Preserve inline title math.
     if ' - ' in title:
         main_t, sub_t = title.split(' - ', 1)
         esc_main = sanitize_latex_preserving_math(main_t.strip())
@@ -1139,7 +1094,6 @@ def patch_latex(tex_content, title, author):
     else:
         tex_content = tex_content.replace(r'\maketitle', f"\\author{{{esc_author}}}\n\\maketitle", 1)
 
-    # 4. Heading unnumbering.
     if UNNUMBER_MARKDOWN_HEADINGS:
         for cmd in ('section', 'subsection', 'subsubsection', 'paragraph', 'subparagraph'):
             tex_content = re.sub(rf'\\{cmd}(?!\*)\{{', rf'\\{cmd}*{{', tex_content)
@@ -1148,7 +1102,6 @@ def patch_latex(tex_content, title, author):
 
 
 def brace_end(text, start):
-    """Return the index after a balanced {...} group, or raise ValueError."""
     if start >= len(text) or text[start] != '{':
         raise ValueError("Expected opening brace")
     depth = 0
@@ -1168,7 +1121,6 @@ def brace_end(text, start):
 
 
 def column_count(spec):
-    """Count top-level standard columns, ignoring width/decorator contents."""
     count = 0
     i = 0
     while i < len(spec):
@@ -1206,7 +1158,6 @@ def column_count(spec):
 
 
 def fit_longtables(text):
-    """Fit standard longtables and keep HTML captions in their header/footer."""
     opening = re.compile(r'\\begin\{longtable\}(?:\[[^\]]*\])?\s*\{')
     ending = r'\end{longtable}'
     replacements = []
@@ -1255,15 +1206,6 @@ def fit_longtables(text):
 
 
 def extract_latex_errors(log_text, context_lines=4):
-    """
-    Pull the actual '!'-marked error(s) out of a XeLaTeX log.
-
-    A XeLaTeX log is mostly hundreds of lines of package-loading noise before
-    the one or two lines that matter. This finds every line starting with '!'
-    (LaTeX's own error marker) and returns it plus a few following lines of
-    context (which usually include the source line number, e.g. 'l.951 ...').
-    Falls back to the tail of the log if no '!' marker is found at all.
-    """
     lines = log_text.splitlines()
     blocks = []
     i = 0
@@ -1280,7 +1222,6 @@ def extract_latex_errors(log_text, context_lines=4):
 
 
 def compile_pdf(temp_tex, target_dir, max_passes=3):
-    """Rerun XeLaTeX only when its output requests another pass."""
     rerun = re.compile(
         r'rerun to get|label\(s\) may have changed|rerun to get cross-references|'
         r'table widths have changed|rerun LaTeX|Please \(re\)run', re.IGNORECASE
@@ -1300,7 +1241,6 @@ def compile_pdf(temp_tex, target_dir, max_passes=3):
 
 
 def process_single_file(ipynb_path, override_title=None, debug=False):
-    """Converts a notebook to PDF with clean title, pandas tables, and LaTeX patches."""
     ipynb_path = os.path.abspath(ipynb_path)
     if not os.path.exists(ipynb_path):
         print(f"[!] File not found: {ipynb_path}")
@@ -1384,26 +1324,62 @@ def process_single_file(ipynb_path, override_title=None, debug=False):
             print(f"    [DEBUG] Temporary artifacts preserved at: {temp_base}*")
 
 
-def create_notebooks(hw_num, num_problems, exam=False):
-    label = "Exam" if exam else "Homework"
-    prefix = "Exam" if exam else "HW"
-    base_dir = get_base_path(exam=exam)
+def create_notebooks(hw_num, num_problems, category="hw", exam=False, separate=False):
+    """Generate notebooks for homework, exams, or discussions."""
+    if exam or category == "exam":
+        category = "exam"
+        label = "Exam"
+        prefix = "Exam"
+    elif category in ("disc", "discussion"):
+        category = "disc"
+        label = "Discussion"
+        prefix = "Discussion"
+    else:
+        category = "hw"
+        label = "Homework"
+        prefix = "HW"
+
+    base_dir = get_base_path(category=category)
     target_path = os.path.join(base_dir, f"{prefix}{hw_num}")
     os.makedirs(target_path, exist_ok=True)
 
+    starter_code = STARTER_CODE
+    ai_declaration = (
+        "## Discussion\n\n(discussion)" if category == "exam" else
+        "## Discussion\n\nAI Declaration: (declaration)\n\n(discussion)"
+    )
+
+    # Discussions combine all problems into a single file by default unless -s / --separate is passed
+    if category == "disc" and not separate:
+        filename = f"{FIRST_NAME}_{LAST_NAME}_{prefix}{hw_num}.ipynb"
+        filepath = os.path.join(target_path, filename)
+
+        if os.path.exists(filepath):
+            choice = input(f"[?] {filename} already exists. Overwrite? (y/n): ").lower()
+            if choice != 'y':
+                return
+
+        nb = nbf.v4.new_notebook()
+        cells = [
+            nbf.v4.new_markdown_cell(f"# {label} {hw_num}\n**{FIRST_NAME} {LAST_NAME}**")
+        ]
+        for i in range(1, num_problems + 1):
+            cells.extend([
+                nbf.v4.new_markdown_cell(f"# {label} {hw_num}: Problem {i} - *Problem Title*"),
+                nbf.v4.new_markdown_cell("(statement)"),
+                nbf.v4.new_markdown_cell("## Solution"),
+                nbf.v4.new_code_cell(starter_code),
+                nbf.v4.new_markdown_cell(ai_declaration),
+            ])
+        nb['cells'] = cells
+        with open(filepath, 'w', encoding='utf-8') as f:
+            nbf.write(nb, f)
+        print(f"  + Generated: {filename} (Contains all {num_problems} problems)")
+        return
+
+    # Standard flow: separate file per problem
     overwrite_all = False
     skip_all = False
-
-    starter_code = (
-        "# Setup & settings\n"
-        "import math\n"
-        "import numpy as np\n"
-        "from scipy.optimize import fsolve\n"
-        "import matplotlib.pyplot as plt\n"
-        "import pandas as pd\n\n"
-        "# Display tables in VS Code; genhw.py converts HTML tables for PDF.\n"
-        "pd.set_option('styler.render.repr', 'html')\n"
-    )
 
     for i in range(1, num_problems + 1):
         filename = f"{FIRST_NAME}_{LAST_NAME}_{prefix}{hw_num}_Problem{i:02d}.ipynb"
@@ -1414,11 +1390,13 @@ def create_notebooks(hw_num, num_problems, exam=False):
             if choice == 'all':
                 overwrite_all = True
             elif choice == 'skip':
-                skip_all = True; continue
+                skip_all = True
+                continue
             elif choice != 'y':
                 continue
 
-        if skip_all: continue
+        if skip_all:
+            continue
 
         nb = nbf.v4.new_notebook()
         cells = [
@@ -1427,10 +1405,7 @@ def create_notebooks(hw_num, num_problems, exam=False):
             nbf.v4.new_markdown_cell("(statement)"),
             nbf.v4.new_markdown_cell("## Solution"),
             nbf.v4.new_code_cell(starter_code),
-            nbf.v4.new_markdown_cell(
-                "## Discussion\n\n(discussion)" if exam else
-                "## Discussion\n\nAI Declaration: (declaration)\n\n(discussion)"
-            )
+            nbf.v4.new_markdown_cell(ai_declaration)
         ]
         nb['cells'] = cells
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -1454,42 +1429,48 @@ def positive_int(value):
 # ==============================================================================
 
 def main():
-    # Base parser shared with all commands so --skip-update is accepted anywhere
     base_parser = argparse.ArgumentParser(add_help=False)
     base_parser.add_argument("--skip-update", action="store_true", help="Skip checking for updates")
 
     parser = argparse.ArgumentParser(
-        description="Homework and Exam Notebook/PDF Tool",
+        description="Homework, Exam, and Discussion Notebook/PDF Tool",
         parents=[base_parser]
     )
     subparsers = parser.add_subparsers(dest="command")
 
+    # Command: gen
     gen = subparsers.add_parser('gen', parents=[base_parser], help="Create problem notebook templates")
     gen_target = gen.add_mutually_exclusive_group(required=True)
     gen_target.add_argument('-hw', '--hw_num', type=positive_int, help='Homework number')
     gen_target.add_argument('-exam', '--exam', '--exam_num', dest='exam_num', type=positive_int, help='Exam number')
-    gen.add_argument('-n', '--num', type=positive_int, required=True, help='Number of problem notebooks to create')
+    gen_target.add_argument('-d', '-disc', '--disc', '--discussion', '--disc_num', dest='disc_num', type=positive_int,
+                           help='Discussion number')
+    gen.add_argument('-n', '--num', type=positive_int, required=True, help='Number of problem notebooks/sections to create')
+    gen.add_argument('-s', '--separate', action='store_true',
+                     help='Generate separate problem files for discussions (default is single combined file)')
 
+    # Command: pdf
     pdf = subparsers.add_parser('pdf', parents=[base_parser], help="Export notebooks to PDF")
     pdf_target = pdf.add_mutually_exclusive_group(required=True)
     pdf_target.add_argument('-hw', '--hw_num', type=positive_int, help='Export a homework folder')
-    pdf_target.add_argument('-exam', '--exam', '--exam_num', dest='exam_num', type=positive_int,
-                            help='Export an exam folder')
+    pdf_target.add_argument('-exam', '--exam', '--exam_num', dest='exam_num', type=positive_int, help='Export an exam folder')
+    pdf_target.add_argument('-d', '-disc', '--disc', '--discussion', '--disc_num', dest='disc_num', type=positive_int,
+                           help='Export a discussion folder')
     pdf_target.add_argument('-m', '--manual', type=str, help='Export one notebook by path')
     pdf.add_argument('-t', '--title', type=str, help='Manually override document title')
-    pdf.add_argument('-d', '--debug', action='store_true', help='Preserve intermediate LaTeX files')
+    pdf.add_argument('-dbg', '--debug', action='store_true', help='Preserve intermediate LaTeX files')
 
     # Command: config
     cfg_cmd = subparsers.add_parser('config', parents=[base_parser], help="View or modify user configuration")
     cfg_cmd.add_argument('--set', nargs='+',
-                         help="Set config values (e.g. --set first_name=Alice subfolder='Homework')")
+                         help="Set config values (e.g. --set first_name=Alice subfolder='Homework Problems')")
 
     # Command: update
     subparsers.add_parser('update', parents=[base_parser], help="Force check and pull updates from GitHub")
 
     args = parser.parse_args()
 
-    # Load configuration from genhw_config.json
+    # Load configuration
     cfg = load_config()
     reload_globals_from_config(cfg)
 
@@ -1504,7 +1485,6 @@ def main():
     if cfg.get("check_updates", True) and not args.skip_update and args.command != 'config':
         updated, status = check_for_updates(verbose=False)
         if updated:
-            # Place --skip-update right after the script name before subcommands
             clean_args = ["--skip-update"] + [arg for arg in sys.argv[1:] if arg != "--skip-update"]
             print("[*] Resuming command with updated version...\n")
             try:
@@ -1541,20 +1521,36 @@ def main():
             return
 
     if args.command == 'gen':
-        exam = args.exam_num is not None
-        create_notebooks(args.exam_num if exam else args.hw_num, args.num, exam=exam)
+        if args.disc_num is not None:
+            create_notebooks(args.disc_num, args.num, category="disc", separate=args.separate)
+        elif args.exam_num is not None:
+            create_notebooks(args.exam_num, args.num, category="exam")
+        else:
+            create_notebooks(args.hw_num, args.num, category="hw")
+
     elif args.command == 'pdf':
         if args.manual:
             process_single_file(args.manual, override_title=args.title, debug=args.debug)
-        elif args.hw_num is not None or args.exam_num is not None:
-            exam = args.exam_num is not None
-            prefix = "Exam" if exam else "HW"
-            number = args.exam_num if exam else args.hw_num
-            base_dir = get_base_path(exam=exam)
+        elif args.hw_num is not None or args.exam_num is not None or args.disc_num is not None:
+            if args.disc_num is not None:
+                category = "disc"
+                prefix = "Discussion"
+                number = args.disc_num
+            elif args.exam_num is not None:
+                category = "exam"
+                prefix = "Exam"
+                number = args.exam_num
+            else:
+                category = "hw"
+                prefix = "HW"
+                number = args.hw_num
+
+            base_dir = get_base_path(category=category)
             target_dir = os.path.join(base_dir, f"{prefix}{number}")
             if not os.path.exists(target_dir):
                 print(f"[!] Folder {target_dir} not found.")
                 return
+
             files = sorted(f for f in os.listdir(target_dir)
                            if f.lower().endswith('.ipynb')
                            and not f.lower().startswith('__tmp_')
@@ -1564,7 +1560,7 @@ def main():
             for f in files:
                 process_single_file(os.path.join(target_dir, f), override_title=args.title, debug=args.debug)
         else:
-            print("[!] Provide -hw, -exam, or -m")
+            print("[!] Provide -hw, -exam, -d, or -m")
     else:
         parser.print_help()
 
