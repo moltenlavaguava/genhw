@@ -1299,8 +1299,19 @@ def repair_empty_preambles(text):
         repairs.append((spec_open + 1, spec_end - 1, new_spec))
     for start, end, new_spec in reversed(repairs):
         text = text[:start] + new_spec + text[end:]
-    if repairs:
-        print(f"    [*] Repaired {len(repairs)} table(s) with an empty column specification.")
+    # Math arrays: \begin{array}{} is accepted by MathJax (VS Code) but not LaTeX.
+    array_open = re.compile(r'\\begin\{array\}(?:\[[^\]]*\])?\s*\{\s*\}')
+    array_repairs = []
+    for match in array_open.finditer(text):
+        end_arr = text.find('\\end{array}', match.end())
+        body = text[match.end():end_arr] if end_arr != -1 else text[match.end():match.end() + 2000]
+        cols = _first_row_column_count(body) or 1
+        array_repairs.append((match.start(), match.end(), '\\begin{array}{' + 'l' * cols + '}'))
+    for start, end, repl in reversed(array_repairs):
+        text = text[:start] + repl + text[end:]
+    total = len(repairs) + len(array_repairs)
+    if total:
+        print(f"    [*] Repaired {total} table/array(s) with an empty column specification.")
     return text
 
 
