@@ -1125,7 +1125,7 @@ def patch_latex(tex_content, title, author):
         for cmd in ('section', 'subsection', 'subsubsection', 'paragraph', 'subparagraph'):
             tex_content = re.sub(rf'\\{cmd}(?!\*)\{{', rf'\\{cmd}*{{', tex_content)
 
-    return fit_longtables(tex_content)
+    return repair_empty_preambles(fit_longtables(tex_content))
 
 
 def brace_end(text, start):
@@ -1229,6 +1229,78 @@ def fit_longtables(text):
         replacements.append((match.start(), end_table + len(ending), replacement))
     for start, end, replacement in reversed(replacements):
         text = text[:start] + replacement + text[end:]
+    return text
+
+
+def _first_row_column_count(body):
+    """Count top-level '&' separated cells in the first data row of a table body."""
+    depth = 0
+    cells = 1
+    seen_content = False
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == '\\':
+            if body.startswith('\\\\', i) and depth == 0 and seen_content:
+                return cells
+            m = re.match(r'\\(?:toprule|midrule|bottomrule|hline|noalign|endhead|endfirsthead|endfoot|endlastfoot)\b(?:\{\})?', body[i:])
+            if m:
+                i += m.end()
+                continue
+            if body.startswith('\\&', i):
+                seen_content = True
+                i += 2
+                continue
+            seen_content = True
+            i += 2
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+        elif ch == '&' and depth == 0:
+            cells += 1
+        elif not ch.isspace():
+            seen_content = True
+        i += 1
+    return cells if seen_content else 0
+
+
+def repair_empty_preambles(text):
+    """
+    Safety net: LaTeX's array package aborts with 'Empty preamble' when a
+    longtable/tabular has no usable column spec. Rebuild such specs from the
+    first row of the table instead of failing the whole PDF.
+    """
+    opening = re.compile(r'\\begin\{(longtable|tabular)\}(?:\[[^\]]*\])?\s*\{')
+    repairs = []
+    for match in opening.finditer(text):
+        try:
+            spec_open = match.end() - 1
+            spec_end = brace_end(text, spec_open)
+            spec = text[spec_open + 1:spec_end - 1]
+            if column_count(spec) >= 1:
+                continue
+        except ValueError:
+            # Unsupported or unparsable spec: only treat it as broken if it is
+            # literally empty/whitespace; otherwise leave it alone.
+            if text[spec_open + 1:spec_open + 2] != '}' and spec.strip():
+                continue
+        env = match.group(1)
+        end_marker = '\\end{' + env + '}'
+        end_table = text.find(end_marker, spec_end)
+        body = text[spec_end:end_table] if end_table != -1 else text[spec_end:spec_end + 2000]
+        cols = _first_row_column_count(body) or 1
+        width = 0.96 / cols
+        new_spec = ''.join(
+            rf'>{{\raggedright\arraybackslash}}p{{\dimexpr {width:.6f}\linewidth-2\tabcolsep\relax}}'
+            for _ in range(cols)
+        )
+        repairs.append((spec_open + 1, spec_end - 1, new_spec))
+    for start, end, new_spec in reversed(repairs):
+        text = text[:start] + new_spec + text[end:]
+    if repairs:
+        print(f"    [*] Repaired {len(repairs)} table(s) with an empty column specification.")
     return text
 
 
